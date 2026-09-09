@@ -46,5 +46,17 @@ runs:
         echo "SUSFS_COMMIT=$SUSFS_COMMIT" >> "$GITHUB_ENV"
         echo "Using SUSFS commit: $SUSFS_COMMIT"
 
-        patch -p1 < "${{ github.workspace }}/kernel_patches/pershoot/susfs4ksu/0001-pershoot-Allow-core-to-be-built-with-no-features.patch"
-        patch -p1 < "${{ github.workspace }}/kernel_patches/pershoot/susfs4ksu/0002-pershoot-Implement-SuSFS-and-Toolkit-coexistence.patch"
+        # kernel_patches@4285cd1 deleted these two patches while this action
+        # still applies them. Fall back to the commit right before the deletion.
+        PERSHOOT_PIN=757201d983e2549dc7945a21fa6a056eb2e55263
+        PERSHOOT_RAW="https://raw.githubusercontent.com/WildKernels/kernel_patches/${PERSHOOT_PIN}/pershoot/susfs4ksu"
+        for p in 0001-pershoot-Allow-core-to-be-built-with-no-features.patch \
+                 0002-pershoot-Implement-SuSFS-and-Toolkit-coexistence.patch; do
+          LOCAL="${{ github.workspace }}/kernel_patches/pershoot/susfs4ksu/$p"
+          if [ ! -f "$LOCAL" ]; then
+            echo "missing in kernel_patches, fetching from pin: $p"
+            mkdir -p "$(dirname "$LOCAL")"
+            retry curl -fsSL -o "$LOCAL" "$PERSHOOT_RAW/$p"
+          fi
+          patch -p1 < "$LOCAL"
+        done
