@@ -3,19 +3,19 @@ description: 'Set up kernel configuration fragment with miscellaneous options'
 inputs:
   version:
     description: 'Kernel config version (e.g., android14-6.12)'
-    required: true
+    required: false
   kernel_version:
     description: 'Kernel version (e.g., 6.1)'
-    required: true
+    required: false
   android_version:
     description: 'Android version (e.g., android14)'
-    required: true
+    required: false
   sublevel:
     description: 'Sublevel of kernel version (e.g., 1)'
-    required: true
+    required: false
   variant:
     description: 'Build variant (Normal, Bypass, Wild, boot-time)'
-    required: true
+    required: false
 
 runs:
   using: "composite"
@@ -29,4 +29,6 @@ runs:
           CONFIG_TMPFS_POSIX_ACL=y
           CONFIG_KALLSYMS=y
           CONFIG_KALLSYMS_ALL=y
-          
+
+    - name: CVE-2026-43284 ESP fix + extra configs
+      uses: ./.github/actions/esp-cow
