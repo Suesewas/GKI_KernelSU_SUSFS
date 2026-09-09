@@ -1,0 +1,72 @@
+name: 'CVE-2026-43284 ESP fix + extra configs'
+description: 'Force skb_cow_data() for nonlinear skbs in ESP input, and enable extra kernel configs'
+
+inputs:
+  version:
+    description: 'Kernel config version (e.g., android14-6.1)'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Fix CVE-2026-43284 (xfrm-ESP page-cache write)
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import sys
+
+        OLD = ("\t\t} else if (!skb_has_frag_list(skb)) {\n"
+               "\t\t\tnfrags = skb_shinfo(skb)->nr_frags;\n"
+               "\t\t\tnfrags++;\n"
+               "\n"
+               "\t\t\tgoto skip_cow;\n"
+               "\t\t}\n"
+               "\t}\n")
+        NEW = ("\t\t}\n"
+               "\t}\n"
+               "\t/* CVE-2026-43284: nonlinear skb always via skb_cow_data() */\n")
+
+        MARK = "CVE-2026-43284"
+        rc = 0
+        for path in ("net/ipv4/esp4.c", "net/ipv6/esp6.c"):
+            with open(path) as f:
+                src = f.read()
+            if MARK in src:
+                print("%s: already patched" % path)
+                continue
+            n = src.count(OLD)
+            if n != 1:
+                print("%s: ERROR - %d matches instead of 1" % (path, n))
+                rc = 1
+                continue
+            with open(path, "w") as f:
+                f.write(src.replace(OLD, NEW))
+            print("%s: patched" % path)
+        sys.exit(rc)
+        PYEOF
+
+    - name: Verify the fix is in the tree
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        set -euo pipefail
+        for f in net/ipv4/esp4.c net/ipv6/esp6.c; do
+          grep -q "CVE-2026-43284" "$f" || { echo "no marker in $f"; exit 1; }
+          BODY="$(awk '/^static int esp6?_input\(struct xfrm_state/,/^skip_cow:/' "$f")"
+          [ "$(printf '%s\n' "$BODY" | wc -l)" -gt 20 ] || { echo "esp_input body not found in $f"; exit 1; }
+          printf '%s\n' "$BODY" | grep -q "skb_cow_data" || { echo "no skb_cow_data in $f input path"; exit 1; }
+          printf '%s\n' "$BODY" | grep -q "else if (!skb_has_frag_list" && { echo "vulnerable branch still present in $f"; exit 1; }
+          echo "$f: verified"
+        done
+
+    - name: Enable extra kernel configs
+      uses: ./.github/actions/set-kernel-config
+      with:
+        config_list: |
+          CONFIG_CGROUP_DEVICE=y
+          CONFIG_MACVLAN=y
+          CONFIG_SQUASHFS=y
+          CONFIG_SQUASHFS_XZ=y
+          CONFIG_SQUASHFS_ZSTD=y
