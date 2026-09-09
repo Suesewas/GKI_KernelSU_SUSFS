@@ -4,7 +4,7 @@ description: 'Force skb_cow_data() for nonlinear skbs in ESP input, and enable e
 inputs:
   version:
     description: 'Kernel config version (e.g., android14-6.1)'
-    required: true
+    required: false
 
 runs:
   using: "composite"
@@ -15,34 +15,34 @@ runs:
       run: |
         set -euo pipefail
         python3 - <<'PYEOF'
-        import sys
+        import re, sys
 
-        OLD = ("\t\t} else if (!skb_has_frag_list(skb)) {\n"
-               "\t\t\tnfrags = skb_shinfo(skb)->nr_frags;\n"
-               "\t\t\tnfrags++;\n"
-               "\n"
-               "\t\t\tgoto skip_cow;\n"
-               "\t\t}\n"
-               "\t}\n")
-        NEW = ("\t\t}\n"
-               "\t}\n"
-               "\t/* CVE-2026-43284: nonlinear skb always via skb_cow_data() */\n")
-
+        RX = re.compile(
+            r"\}\s*else\s+if\s*\(\s*!skb_has_frag_list\(skb\)\s*\)\s*\{"
+            r".*?goto\s+skip_cow\s*;\s*\}", re.S)
+        NEW = "}  /* CVE-2026-43284: nonlinear skb always via skb_cow_data() */"
         MARK = "CVE-2026-43284"
+
         rc = 0
         for path in ("net/ipv4/esp4.c", "net/ipv6/esp6.c"):
-            with open(path) as f:
-                src = f.read()
+            src = open(path).read()
             if MARK in src:
                 print("%s: already patched" % path)
                 continue
-            n = src.count(OLD)
-            if n != 1:
-                print("%s: ERROR - %d matches instead of 1" % (path, n))
+            body = re.search(r"static int esp6?_input\(struct xfrm_state.*?\nskip_cow:", src, re.S)
+            if not body:
+                print("%s: ERROR - esp_input body not found" % path)
                 rc = 1
                 continue
-            with open(path, "w") as f:
-                f.write(src.replace(OLD, NEW))
+            seg = body.group(0)
+            new_seg, n = RX.subn(NEW, seg, count=1)
+            if n != 1:
+                print("%s: ERROR - fast path not found, dumping region:" % path)
+                m = re.search(r".{0,400}skb_cloned\(skb\).{0,600}", seg, re.S)
+                print(repr(m.group(0)) if m else repr(seg[:800]))
+                rc = 1
+                continue
+            open(path, "w").write(src.replace(seg, new_seg, 1))
             print("%s: patched" % path)
         sys.exit(rc)
         PYEOF
@@ -56,8 +56,8 @@ runs:
           grep -q "CVE-2026-43284" "$f" || { echo "no marker in $f"; exit 1; }
           BODY="$(awk '/^static int esp6?_input\(struct xfrm_state/,/^skip_cow:/' "$f")"
           [ "$(printf '%s\n' "$BODY" | wc -l)" -gt 20 ] || { echo "esp_input body not found in $f"; exit 1; }
-          printf '%s\n' "$BODY" | grep -q "skb_cow_data" || { echo "no skb_cow_data in $f input path"; exit 1; }
-          printf '%s\n' "$BODY" | grep -q "else if (!skb_has_frag_list" && { echo "vulnerable branch still present in $f"; exit 1; }
+          printf '%s\n' "$BODY" | grep -q "skb_cow_data" || { echo "no skb_cow_data in $f"; exit 1; }
+          printf '%s\n' "$BODY" | grep -q "skb_has_frag_list" && { echo "fast path still present in $f"; exit 1; }
           echo "$f: verified"
         done
 
