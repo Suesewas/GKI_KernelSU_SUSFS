@@ -2,7 +2,7 @@ name: Setup pinned root implementation
 description: Clone exactly one supported root implementation at a verified commit
 inputs:
   flavor:
-    description: 'classic, next, or resukisu'
+    description: 'kernelsu, next, or resukisu'
     required: true
   commit:
     description: 'Full immutable commit SHA'
@@ -20,7 +20,7 @@ runs:
         flavor="${{ inputs.flavor }}"
         expected_commit="${{ inputs.commit }}"
         case "$flavor" in
-          classic)
+          kernelsu)
             repo="https://github.com/tiann/KernelSU.git"
             directory="KernelSU"
             manager="KernelSU Manager"
@@ -102,3 +102,11 @@ runs:
       with:
         config_list: |
           CONFIG_KSU=y
+
+    - name: Disable multi-manager for ReSukiSU
+      if: inputs.flavor == 'resukisu'
+      uses: ./.github/actions/set-kernel-config
+      with:
+        config_list: |
+          CONFIG_KSU_MULTI_MANAGER_SUPPORT=n
+          CONFIG_KSU_TOOLKIT_SUPPORT=y

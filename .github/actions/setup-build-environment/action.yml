@@ -8,6 +8,14 @@ inputs:
   sublevel:
     description: 'Kernel sublevel'
     required: true
+  kernel_patches_commit:
+    description: 'Pinned kernel_patches commit (empty = main tip)'
+    required: false
+    default: ''
+  anykernel3_commit:
+    description: 'Pinned AnyKernel3 commit (empty = gki-2.0 tip)'
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -38,13 +46,23 @@ runs:
 
         if [ -d "${{ github.workspace }}/kernel_patches" ]; then rm -rf "${{ github.workspace }}/kernel_patches"; fi
         retry git clone https://github.com/WildKernels/kernel_patches.git "${{ github.workspace }}/kernel_patches"
+        if [ -n "${{ inputs.kernel_patches_commit }}" ]; then
+          git -C "${{ github.workspace }}/kernel_patches" fetch --depth=1 origin "${{ inputs.kernel_patches_commit }}"
+          git -C "${{ github.workspace }}/kernel_patches" checkout "${{ inputs.kernel_patches_commit }}"
+          [ "$(git -C "${{ github.workspace }}/kernel_patches" rev-parse HEAD)" = "${{ inputs.kernel_patches_commit }}" ] || { echo "kernel_patches pin mismatch" >&2; exit 1; }
+        fi
 
         if [ -d "${{ github.workspace }}/AnyKernel3" ]; then rm -rf "${{ github.workspace }}/AnyKernel3"; fi
         retry git clone https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 "${{ github.workspace }}/AnyKernel3"
+        if [ -n "${{ inputs.anykernel3_commit }}" ]; then
+          git -C "${{ github.workspace }}/AnyKernel3" fetch --depth=1 origin "${{ inputs.anykernel3_commit }}"
+          git -C "${{ github.workspace }}/AnyKernel3" checkout "${{ inputs.anykernel3_commit }}"
+          [ "$(git -C "${{ github.workspace }}/AnyKernel3" rev-parse HEAD)" = "${{ inputs.anykernel3_commit }}" ] || { echo "AnyKernel3 pin mismatch" >&2; exit 1; }
+        fi
 
     - name: Install build deps for BTF generation (android12-5.10)
       shell: bash
-      if: ${{ inputs.version == 'android12-5.10' }}
+      if: inputs.version == 'android12-5.10'
       run: |
         set -euo pipefail
         sudo apt-get update -qq

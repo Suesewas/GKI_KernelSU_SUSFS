@@ -8,6 +8,9 @@ outputs:
   module_path:
     description: 'Path to the flashable metamodule ZIP'
     value: ${{ steps.package.outputs.module_path }}
+  module_dir:
+    description: 'Path to the extracted metamodule directory (module.prop, bin/, ...)'
+    value: ${{ steps.package.outputs.module_dir }}
   commit:
     description: 'Verified NoMount source SHA'
     value: ${{ steps.package.outputs.commit }}
@@ -68,4 +71,5 @@ runs:
         )
         sha256sum "$module_zip" > "${module_zip}.sha256"
         echo "module_path=$module_zip" >> "$GITHUB_OUTPUT"
+        echo "module_dir=$module_dir" >> "$GITHUB_OUTPUT"
         echo "commit=$actual_commit" >> "$GITHUB_OUTPUT"

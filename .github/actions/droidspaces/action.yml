@@ -16,6 +16,10 @@ inputs:
   sublevel:
     description: 'Kernel sublevel'
     required: true
+  droidspaces_commit:
+    description: 'Pinned Droidspaces-OSS commit (empty = main tip)'
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -28,6 +32,16 @@ runs:
         attempts: 5
         delay: 5
         workdir: ${{ github.workspace }}
+
+    - name: Pin Droidspaces-OSS to resolved commit
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        if [ -n "${{ inputs.droidspaces_commit }}" ]; then
+          git -C Droidspaces-OSS fetch --depth=1 origin "${{ inputs.droidspaces_commit }}"
+          git -C Droidspaces-OSS checkout "${{ inputs.droidspaces_commit }}"
+          [ "$(git -C Droidspaces-OSS rev-parse HEAD)" = "${{ inputs.droidspaces_commit }}" ] || { echo "Droidspaces pin mismatch" >&2; exit 1; }
+        fi
 
     - name: Apply the SYSVIPC kABI fix
       shell: bash

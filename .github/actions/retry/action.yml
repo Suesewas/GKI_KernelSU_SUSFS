@@ -23,7 +23,7 @@ runs:
     - shell: bash
       working-directory: ${{ inputs.workdir }}
       run: |
-        set -u
+        set -uo pipefail
         attempts="${{ inputs.attempts }}"
         delay="${{ inputs.delay }}"
 

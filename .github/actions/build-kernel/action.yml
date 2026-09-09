@@ -1,9 +1,6 @@
 name: 'Build Kernel'
 description: 'Builds kernel using legacy build.sh or Bazel (kleaf)'
 inputs:
-  bypass:
-    description: 'Whether to add the bypass hack or not'
-    required: true
   version:
     description: 'Kernel config version (e.g., android14-6.1)'
     required: true
@@ -11,29 +8,6 @@ inputs:
 runs:
   using: composite
   steps:
-  - name: 'Activate Bypass'
-    shell: bash
-    working-directory: ${{ github.workspace }}/kernel
-    run: |
-      set -euo pipefail
-      if [ "${{ inputs.bypass }}" = "true" ]; then
-        if [[ ${{ inputs.version }} == "android14-6.1" || ${{ inputs.version }} == "android15-6.6" || ${{ inputs.version }} == "android16-6.12" ]]; then
-          TARGET_FILE="${{ github.workspace }}/kernel/common/kernel/module/version.c"
-        else
-          TARGET_FILE="${{ github.workspace }}/kernel/common/kernel/module.c"
-        fi
-
-        sed -i '/bad_version:/{:a;n;/return 0;/{s/return 0;/return 1;/;b};ba}' "$TARGET_FILE"
-
-        if ! grep -A 5 "bad_version:" "$TARGET_FILE" | grep -q "return 1;"; then
-          echo "Patch failed! 'return 1;' not found at bad_version:"
-          grep -A 10 "bad_version:" "$TARGET_FILE" || true
-          exit 1
-        fi
-      else
-        echo "Bypass hack not applied as per input parameter."
-      fi
-
   - name: Setup Kernel Configs
     if: false
     uses: ./.github/actions/set-kernel-config
@@ -53,18 +27,15 @@ runs:
         OUT_DIR="/home/runner/out" \
         LTO=thin \
         BUILD_CONFIG=common/build.config.gki.aarch64 \
-        build/build.sh -j"$(nproc)" \
         CC="/usr/bin/ccache clang" \
-        CXX="/usr/bin/ccache clang+" \
+        CXX="/usr/bin/ccache clang++" \
         HOSTCC="/usr/bin/ccache clang" \
-        HOSTCXX="/usr/bin/ccache clang+"
+        HOSTCXX="/usr/bin/ccache clang++" \
+        build/build.sh -j"$(nproc)"
       else
-        if [ "${{ inputs.bypass }}" = "false" ]; then
-          sed -i '/name = "kernel_aarch64",/a\    check_defconfig = "disabled",' common/BUILD.bazel
-        fi
+        sed -i '/name = "kernel_aarch64",/a\    check_defconfig = "disabled",' common/BUILD.bazel
         tools/bazel build \
           --config=fast \
-          --config=stamp \
           --disk_cache=/home/runner/.cache/bazel \
           //common:kernel_aarch64/Image
       fi
@@ -76,31 +47,14 @@ runs:
       set -euo pipefail
       if [ -f "bazel-bin/common/kernel_aarch64/Image" ]; then
         echo "Found Image at bazel-bin/common/kernel_aarch64/Image"
-        if [[ ${{ inputs.bypass }} == "true" ]]; then
-          cp "bazel-bin/common/kernel_aarch64/Image" "${{ github.workspace }}/AnyKernel3/Bypass-Image"
-        else
-          cp "bazel-bin/common/kernel_aarch64/Image" "${{ github.workspace }}/AnyKernel3/Image"
-        fi
+        cp "bazel-bin/common/kernel_aarch64/Image" "${{ github.workspace }}/AnyKernel3/Image"
         exit 0
         fi
       if [ -f "/home/runner/out/dist/Image" ]; then
         echo "Found Image at /home/runner/out/dist/Image"
-        if [[ ${{ inputs.bypass }} == "true" ]]; then
-          cp "/home/runner/out/dist/Image" "${{ github.workspace }}/AnyKernel3/Bypass-Image"
-        else
-          cp "/home/runner/out/dist/Image" "${{ github.workspace }}/AnyKernel3/Image"
-        fi
+        cp "/home/runner/out/dist/Image" "${{ github.workspace }}/AnyKernel3/Image"
         exit 0
       fi
 
       exit 1
-
-  - name: 'Patch AnyKernel3 for Bypass Hack'
-    shell: bash
-    if: ${{ inputs.bypass == 'true' }}
-    working-directory: ${{ github.workspace }}/AnyKernel3
-    run: |
-      set -euo pipefail
-      cp ${{ github.action_path }}/patches/bypass.patch "${{ github.workspace }}/AnyKernel3/bypass.patch"
-      patch -p1 < bypass.patch
 

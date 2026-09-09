@@ -1,6 +1,6 @@
 name: Kernel Build Process
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 on:
@@ -47,11 +47,28 @@ on:
         required: false
         type: string
         default: ""
-      preserve_abi:
+      kernel_patches_commit:
+        required: false
+        type: string
+        default: ""
+      anykernel3_commit:
+        required: false
+        type: string
+        default: ""
+      droidspaces_commit:
+        required: false
+        type: string
+        default: ""
+      brand_name:
+        required: false
+        type: string
+        default: Wild
+      bypass:
         required: false
         type: boolean
         default: false
-      build_bypass:
+      use_cache:
+        description: "Enable ccache/bazel cache (restore/save via release buckets)"
         required: false
         type: boolean
         default: true
@@ -66,38 +83,38 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v7
 
-    - name: 🧹 Emergency Disk Cleanup
+    - name: Emergency Disk Cleanup
       if: false
       uses: ./.github/actions/disk-cleanup
 
     - name: Free Disk Space
       if: true
-      uses: endersonmenezes/free-disk-space@v3  # Use @main for latest, @v3 for stable
+      uses: endersonmenezes/free-disk-space@v4  # Use @main for latest, @v3 for stable
       with:
         remove_android: true
         remove_dotnet: true
         remove_haskell: true
         remove_tool_cache: true
+        remove_swap: true
         remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
         remove_packages_one_command: true
         remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
         rm_cmd: "rmz"  # Use 'rmz' for faster deletion (default: 'rm')
-        rmz_version: "3.1.1"  # Required when rm_cmd is 'rmz'
+        rmz_version: "3.2.0"  # Required when rm_cmd is 'rmz'
         testing: false
 
     - name: Setup more Swap (for LTO)
-      uses: thejerrybao/setup-swap-space@v1   # or pierotofy/set-swap-space
+      uses: pierotofy/set-swap-space@master
       with:
-        swap-size-gb: 16          # 10-24 GB is common for heavy LTO
-        # swap-space-path: /mnt/swapfile   # optional
+        swap-size-gb: 16
 
     - name: Setup Build Environment
       uses: ./.github/actions/setup-build-environment
       with:
         version: ${{ inputs.version }}
         sublevel: ${{ inputs.sublevel }}
-      env:
-        BOOT_SIGN_KEY: ${{ secrets.BOOT_SIGN_KEY }}
+        kernel_patches_commit: ${{ inputs.kernel_patches_commit }}
+        anykernel3_commit: ${{ inputs.anykernel3_commit }}
           
     - name: Download Kernel Repository
       uses: ./.github/actions/download-kernel
@@ -106,14 +123,6 @@ jobs:
         android_version: ${{ inputs.android_version }}
         kernel_version: ${{ inputs.kernel_version }}
         os_patch_level: ${{ inputs.os_patch_level }}
-
-    - name: Build FUSE-BPF Userspace Daemon (Issue #211)
-      if: ${{ contains(inputs.version, 'lts') && inputs.version == 'android16-6.12' }}
-      uses: ./.github/actions/fuse-bpf
-      with:
-        version: ${{ inputs.version }}
-        kernel_version: ${{ inputs.kernel_version }}
-        android_version: ${{ inputs.android_version }}
 
     - name: Set Build Timestamp from Kernel Commit
       shell: bash
@@ -161,48 +170,102 @@ jobs:
         sublevel: ${{ steps.extract.outputs.sublevel }}
         os_patch_level: ${{ inputs.os_patch_level }}
 
-    - name: Capture source ABI/KMI safeguards
-      if: ${{ inputs.preserve_abi }}
-      uses: ./.github/actions/abi-kmi-safeguards
-      with:
-        mode: capture
-
     - name: Setup Selected Root Implementation
-      if: ${{ inputs.root_flavor != '' }}
+      if: inputs.root_flavor != ''
       uses: ./.github/actions/root-setup
       with:
         flavor: ${{ inputs.root_flavor }}
         commit: ${{ inputs.root_commit }}
 
-    - name: Setup KernelSU-Next
-      if: ${{ inputs.root_flavor == '' && (contains(inputs.feature_set, 'KSUN') || inputs.feature_set == 'FULL') }}
-      uses: ./.github/actions/kernelsu
+    - name: Disable SUSFS for ReSukiSU without SUSFS feature
+      if: inputs.root_flavor == 'resukisu' && !contains(inputs.feature_set, 'SUSFS')
+      uses: ./.github/actions/set-kernel-config
       with:
-        ksu_branch: ${{ inputs.ksu_branch }}
+        config_list: |
+          CONFIG_KSU_SUSFS=n
 
-    - name: Verify root ABI/KMI safeguards
-      if: ${{ inputs.preserve_abi }}
-      uses: ./.github/actions/abi-kmi-safeguards
-      with:
-        mode: verify
+    - name: Resolve SUSFS commit
+      id: susfs-cm
+      shell: bash
+      run: |
+        set -euo pipefail
+        # KernelSU-Next (next) always uses the latest susfs4ksu gki branch tip so
+        # SUSFS stays API-matched to the always-latest KernelSU-Next tree. All
+        # other roots (kernelsu, resukisu) use the pinned verified SUSFS commit.
+        if [ "${{ inputs.root_flavor }}" = "next" ]; then
+          BRANCH="gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}"
+          SUSFS_COMMIT="$(git ls-remote https://gitlab.com/simonpunk/susfs4ksu.git "refs/heads/${BRANCH}" | cut -f1)"
+          echo "KernelSU-Next: resolving SUSFS at latest on ${BRANCH} -> ${SUSFS_COMMIT}"
+        else
+          SUSFS_COMMIT="${{ inputs.susfs_commit }}"
+          echo "Using pinned SUSFS commit: ${SUSFS_COMMIT}"
+        fi
+        echo "commit=${SUSFS_COMMIT}" >> "$GITHUB_OUTPUT"
 
     - name: SUSFS
-      if: contains(inputs.feature_set, 'SUSFS') || inputs.feature_set == 'FULL'
+      if: contains(inputs.feature_set, 'SUSFS') || inputs.feature_set == 'All'
       uses: ./.github/actions/susfs
       with:
-        susfs_commit: ${{ inputs.susfs_commit }}
+        susfs_commit: ${{ steps.susfs-cm.outputs.commit }}
         version: ${{ inputs.version }}
         android_version: ${{ inputs.android_version }}
         kernel_version: ${{ inputs.kernel_version }}
         os_patch_level: ${{ inputs.os_patch_level }}
         sublevel: ${{ steps.extract.outputs.sublevel }}
+        root_flavor: ${{ inputs.root_flavor }}
+
+    - name: Fix selinux_hide pointer-bool-conversion on 6.6+ (ALL branches)
+      shell: bash
+      run: |
+        set -euo pipefail
+        KVER="${{ inputs.kernel_version }}"
+        if [ "$(printf '%s\n' "6.6" "$KVER" | sort -V | head -n1)" = "6.6" ]; then
+          echo "[*] KVER $KVER >= 6.6, patching selinux_hide.c (all flavors/branches)"
+          for f in $(find "${{ github.workspace }}" -name selinux_hide.c 2>/dev/null); do
+            # After SUSFS 10_enable (kernelsu only) the declaration becomes
+            #   extern void security_dump_masked_av_fn(...)   (a function)
+            #   if (func) / if (func != NULL) both trigger -Werror:
+            #     -Wpointer-bool-conversion  vs  -Wtautological-pointer-compare
+            # For the function form,  &func != NULL  silences both (clang note).
+            # For the pointer form (resukisu/next, no 10_enable) we want ptr != NULL.
+            if grep -q "extern void security_dump_masked_av_fn" "$f"; then
+              echo "[*] $f is extern-function form (10_enable applied), patching with &"
+              sed -i 's/if (security_dump_masked_av_fn)/if (\&security_dump_masked_av_fn)/g' "$f"
+              sed -i 's/if (security_dump_masked_av_fn != NULL)/if (\&security_dump_masked_av_fn != NULL)/g' "$f"
+              sed -i 's/if (context_struct_compute_av_fn)/if (\&context_struct_compute_av_fn)/g' "$f"
+              sed -i 's/if (context_struct_compute_av_fn != NULL)/if (\&context_struct_compute_av_fn != NULL)/g' "$f"
+              echo "[+] Patched $f (function form)"
+            elif grep -q "if (security_dump_masked_av_fn" "$f"; then
+              echo "[*] $f is pointer form, patching with != NULL"
+              sed -i 's/if (security_dump_masked_av_fn)/if (security_dump_masked_av_fn != NULL)/g' "$f"
+              sed -i 's/if (context_struct_compute_av_fn)/if (context_struct_compute_av_fn != NULL)/g' "$f"
+              echo "[+] Patched $f (pointer form)"
+            else
+              echo "[*] $f already patched"
+            fi
+            # Next (and tiann without 10_enable fallback) declares the 3 helpers as
+            # static on 6.6, but kernel hooks.c/selinuxfs.c reference them as extern
+            # after SUSFS (ReSukiSU uses __maybe_static -> global). Strip static so
+            # the linker can resolve security_context_to_sid_with_policy etc.
+            if grep -q "^static int security_context_to_sid_with_policy" "$f"; then
+              echo "[*] Stripping static from $f helpers (Next 6.6)"
+              sed -i 's/^static int security_context_to_sid_with_policy/int security_context_to_sid_with_policy/g' "$f"
+              sed -i 's/^static int security_sid_to_context_with_policy/int security_sid_to_context_with_policy/g' "$f"
+              sed -i 's/^static void security_compute_av_user_with_policy/void security_compute_av_user_with_policy/g' "$f"
+              # also forward decls (same prefix, same sed covers them)
+              echo "[+] Stripped static from $f"
+            fi
+          done
+        else
+          echo "[-] KVER $KVER < 6.6"
+        fi
 
     - name: Baseband Guard
-      if: (contains(inputs.feature_set, 'BBG') || inputs.feature_set == 'FULL')
+      if: (contains(inputs.feature_set, 'BBG') || inputs.feature_set == 'All')
       uses: ./.github/actions/bbg
 
     - name: Setup Networking
-      if: contains(inputs.feature_set, 'NET') || inputs.feature_set == 'FULL'
+      if: contains(inputs.feature_set, 'NET') || inputs.feature_set == 'All'
       uses: ./.github/actions/networking
       with:
         version: ${{ inputs.version }}
@@ -211,13 +274,15 @@ jobs:
         sublevel: ${{ steps.extract.outputs.sublevel }}
 
     - name: DroidSpaces-OSS Patches
-      if: contains(inputs.feature_set, 'DS') || inputs.feature_set == 'FULL'
+      if: contains(inputs.feature_set, 'DS') || inputs.feature_set == 'All'
       uses: ./.github/actions/droidspaces
       with:
         version: ${{ inputs.version }}
         kernel_version: ${{ inputs.kernel_version }}
+        droidspaces_commit: ${{ inputs.droidspaces_commit }}
 
     - name: Apply NTSync Patches
+      if: contains(inputs.feature_set, 'NTSync')
       uses: ./.github/actions/ntsync
       with:
         version: ${{ inputs.version }}
@@ -225,25 +290,28 @@ jobs:
         sublevel: ${{ steps.extract.outputs.sublevel }}
 
     - name: Apply Ptrace Patch
+      if: contains(inputs.feature_set, 'Ptrace')
       uses: ./.github/actions/ptrace
       with:
         kernel_version: ${{ inputs.kernel_version }}
 
     - name: Apply Unicode Fix Patch
+      if: contains(inputs.feature_set, 'Unicode')
       uses: ./.github/actions/unicode-fix
       with:
         kernel_version: ${{ inputs.kernel_version }}
 
     - name: Apply Performance Patches
       uses: ./.github/actions/performance
-      if: false
+      if: contains(inputs.feature_set, 'Perf')
       with:
         kernel_version: ${{ inputs.kernel_version }}
 
     - name: Setup Misc Configs
       uses: ./.github/actions/misc
 
-    - name: Enable BTF
+    - name: Enable BPF Stack (BTF + eBPF + FUSE-BPF)
+      if: contains(inputs.feature_set, 'BPF')
       uses: ./.github/actions/btf
       with:
         version: ${{ inputs.version }}
@@ -256,14 +324,8 @@ jobs:
         version: ${{ inputs.version }}
         kernel_version: ${{ inputs.kernel_version }}
 
-    - name: Capture approved feature ABI/KMI baseline
-      if: ${{ inputs.preserve_abi }}
-      uses: ./.github/actions/abi-kmi-safeguards
-      with:
-        mode: capture
-
     - name: Integrate NoMount
-      if: ${{ inputs.nomount_commit != '' || contains(inputs.feature_set, 'NOMOUNT') || inputs.feature_set == 'FULL' }}
+      if: contains(inputs.feature_set, 'NoMount') || inputs.feature_set == 'All'
       uses: ./.github/actions/nomount
       with:
         commit: ${{ inputs.nomount_commit }}
@@ -297,27 +359,21 @@ jobs:
         android_version: ${{ inputs.android_version }}
         version: ${{ inputs.version }}
         sublevel: ${{ steps.extract.outputs.sublevel }}
+        brand_name: ${{ inputs.brand_name }}
 
     - name: Remove Protected Exports
-      if: ${{ !inputs.preserve_abi }}
       uses: ./.github/actions/remove-protected-exports
-
-    - name: Verify NoMount ABI/KMI safeguards
-      if: ${{ inputs.preserve_abi }}
-      uses: ./.github/actions/abi-kmi-safeguards
-      with:
-        mode: verify
 
     - name: Clean Kernel Flags
       uses: ./.github/actions/clean-kernel-flags
 
     - name: Scan and collect patch rejects
       id: scan
-      if: ${{ always() }}
+      if: always()
       uses: ./.github/actions/scan-patch-rejects
         
     - name: Upload Rejects
-      if: ${{ always() }}
+      if: always()
       uses: actions/upload-artifact@v7
       with:
         name: ${{ steps.extract.outputs.file_name }}-Rejects
@@ -325,15 +381,8 @@ jobs:
         if-no-files-found: ignore
         compression-level: 9
 
-    - name: Get prebuilt ccache (downloaded once by prepare-ccache)
-      if: false
-      uses: actions/download-artifact@v8
-      with:
-        name: ccache-binary
-        path: ccache-dl
-      continue-on-error: true
-
     - name: 'Setup Cache and Build Environment'
+      if: inputs.use_cache
       uses: ./.github/actions/cache-setup
       with:
         version: ${{ inputs.version }}
@@ -344,24 +393,24 @@ jobs:
     - name: Restore ccache
       id: restore-ccache
       continue-on-error: true
-      if: false && (inputs.version == 'android12-5.10' || inputs.version == 'android13-5.10' || inputs.version == 'android13-5.15')
+      if: inputs.use_cache && (inputs.version == 'android12-5.10' || inputs.version == 'android13-5.10' || inputs.version == 'android13-5.15')
       uses: ./.github/actions/cache-restore
       with:
         cache_path: /home/runner/.ccache
-        cache_key: ${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ steps.extract.outputs.sublevel }}-${{ inputs.os_patch_level }}
-        cache_bucket: ccache-cache
+        cache_key: ${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ steps.extract.outputs.sublevel }}-${{ inputs.os_patch_level }}-${{ inputs.variant }}
+        cache_bucket: ccache-cache-${{ inputs.version }}-${{ inputs.variant }}
         restore_keys: |
           ${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ steps.extract.outputs.sublevel }}-
 
     - name: Restore bazel-cache
       id: restore-bazel
       continue-on-error: true
-      if: false && (inputs.version == 'android14-5.15' || inputs.version == 'android14-6.1' || inputs.version == 'android15-6.6' || inputs.version == 'android16-6.12')
+      if: inputs.use_cache && (inputs.version == 'android14-5.15' || inputs.version == 'android14-6.1' || inputs.version == 'android15-6.6' || inputs.version == 'android16-6.12')
       uses: ./.github/actions/cache-restore
       with:
         cache_path: /home/runner/.cache/bazel
-        cache_key: ${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ steps.extract.outputs.sublevel }}-${{ inputs.os_patch_level }}
-        cache_bucket: bazel-cache
+        cache_key: ${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ steps.extract.outputs.sublevel }}-${{ inputs.os_patch_level }}-${{ inputs.variant }}
+        cache_bucket: bazel-cache-${{ inputs.version }}-${{ inputs.variant }}
         restore_keys: |
           ${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ steps.extract.outputs.sublevel }}-
 
@@ -403,6 +452,13 @@ jobs:
     - name: Initialize Config Fragment
       run: touch "${{ github.workspace }}/wild_gki.fragment"
 
+    - name: Apply Kernel Bypass Hack
+      if: ${{ inputs.bypass == 'true' }}
+      uses: ./.github/actions/bypass-kernel
+      with:
+        version: ${{ inputs.version }}
+        bypass: true
+
     - name: Build Normal Kernel
       env:
         SOURCE_DATE_EPOCH: ${{ env.SOURCE_DATE_EPOCH }}
@@ -410,47 +466,56 @@ jobs:
       uses: ./.github/actions/build-kernel
       with:
         version: ${{ inputs.version }}
-        bypass: false
 
     - name: Get Cache Stats
       uses: ./.github/actions/cache-stats
       with:
         clear_stats: false
 
+    - name: Prune ccache before save
+      if: always() && inputs.use_cache && (inputs.version == 'android12-5.10' || inputs.version == 'android13-5.10' || inputs.version == 'android13-5.15')
+      shell: bash
+      run: |
+        if [ -d /home/runner/.ccache ]; then
+          ccache -c 2>/dev/null || true
+          find /home/runner/.ccache -type f -mtime +0.5 -delete 2>/dev/null || true
+          find /home/runner/.ccache -type d -empty -delete 2>/dev/null || true
+          echo "ccache pruned"; ccache -s 2>/dev/null | head -20 || true
+        fi
+
     - name: Save ccache
       continue-on-error: true
       uses: ./.github/actions/cache-save
-      if: false && (inputs.version == 'android12-5.10' || inputs.version == 'android13-5.10' || inputs.version == 'android13-5.15')
+      if: always() && inputs.use_cache && (inputs.version == 'android12-5.10' || inputs.version == 'android13-5.10' || inputs.version == 'android13-5.15')
       with:
         cache_path: /home/runner/.ccache
-        cache_key: ${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ steps.extract.outputs.sublevel }}-${{ inputs.os_patch_level }}
-        cache_bucket: "ccache-cache"
+        cache_key: ${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ steps.extract.outputs.sublevel }}-${{ inputs.os_patch_level }}-${{ inputs.variant }}
+        cache_bucket: "ccache-cache-${{ inputs.version }}-${{ inputs.variant }}"
         compression_level: 9
-        github_token: ${{ secrets.MY_GITHUB_TOKEN }}
+        github_token: ${{ github.token }}
 
     - name: Save bazel-cache
       continue-on-error: true
       uses: ./.github/actions/cache-save
-      if: false && (inputs.version == 'android14-5.15' || inputs.version == 'android14-6.1' || inputs.version == 'android15-6.6' || inputs.version == 'android16-6.12')
+      if: always() && inputs.use_cache && (inputs.version == 'android14-5.15' || inputs.version == 'android14-6.1' || inputs.version == 'android15-6.6' || inputs.version == 'android16-6.12')
       with:
         cache_path: /home/runner/.cache/bazel
-        cache_key: ${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ steps.extract.outputs.sublevel }}-${{ inputs.os_patch_level }}
-        cache_bucket: "bazel-cache"
+        cache_key: ${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ steps.extract.outputs.sublevel }}-${{ inputs.os_patch_level }}-${{ inputs.variant }}
+        cache_bucket: "bazel-cache-${{ inputs.version }}-${{ inputs.variant }}"
         compression_level: 9
-        github_token: ${{ secrets.MY_GITHUB_TOKEN }}
+        github_token: ${{ github.token }}
 
     - name: Build Bypass Kernel
-      if: ${{ inputs.build_bypass }}
+      if: inputs.build_bypass
       env:
         SOURCE_DATE_EPOCH: ${{ env.SOURCE_DATE_EPOCH }}
         KBUILD_BUILD_TIMESTAMP: ${{ env.KBUILD_BUILD_TIMESTAMP }}
       uses: ./.github/actions/build-kernel
       with:
-        bypass: true
         version: ${{ inputs.version }}
 
-    - name: 📋 Consolidated Build Summary
-      if: ${{ always() }}
+    - name: Consolidated Build Summary
+      if: always()
       shell: bash
       run: |
         SUMMARY_BASE="${{ steps.extract.outputs.file_name }}"
@@ -463,12 +528,19 @@ jobs:
         fi
         SUMMARY_FILE="/tmp/build-summary-${SUMMARY_BASE}.md"
         echo "SUMMARY_BASE=${SUMMARY_BASE}" >> "$GITHUB_ENV"
+
+        # NoMount is optional (nomount_commit input is always populated, so
+        # feature_set is the only reliable signal for whether it was built).
+        NOMOUNT_ENABLED="false"
+        if [ "${{ contains(inputs.feature_set, 'NoMount') || inputs.feature_set == 'All' }}" = "true" ]; then
+          NOMOUNT_ENABLED="true"
+        fi
         
         # Determine build status
         if [ "${{ job.status }}" = "success" ]; then
-          STATUS="✅ Success"
+          STATUS="[+] Success"
         else
-          STATUS="❌ Failed"
+          STATUS="[-] Failed"
         fi
         
         # Get kernel version from Image if available
@@ -486,8 +558,12 @@ jobs:
         ROOT_MANAGER="${ROOT_MANAGER:-KernelSU-Next Manager}"
         ROOT_VERSION="${ROOT_VERSION:-${KSU_TAG}}"
         ROOT_SHA="${ROOT_COMMIT:-${KSU_COMMIT:-N/A}}"
-        NOMOUNT_SHA="${NOMOUNT_COMMIT:-N/A}"
-        SUSFS_SHA="${SUSFS_COMMIT:-N/A}"
+        if [ "$NOMOUNT_ENABLED" = "true" ]; then
+          NOMOUNT_SHA="${NOMOUNT_COMMIT:-${{ inputs.nomount_commit }}}"
+        else
+          NOMOUNT_SHA="N/A"
+        fi
+        SUSFS_SHA="${SUSFS_COMMIT:-${{ inputs.susfs_commit }}}"
         
         # Get SUSFS version from susfs.h if available
         SUSFS_VER="N/A"
@@ -505,7 +581,7 @@ jobs:
         WARNINGS="N/A"
         
         {
-          echo "## ${{ inputs.android_version }} ${{ inputs.kernel_version }}.${{ inputs.sublevel }} (${{ inputs.variant }}) — ${STATUS}"
+          echo "## ${{ inputs.android_version }} ${{ inputs.kernel_version }}.${{ inputs.sublevel }} (${{ inputs.variant }}) - ${STATUS}"
           echo
           echo "| Metric | Value |"
           echo "|--------|-------|"
@@ -529,20 +605,11 @@ jobs:
           
           # Kernel Fixes
           if [ -f /tmp/kernel-fixes-summary.md ]; then
-            echo "### 🔧 Kernel Fixes"
+            echo "### Kernel Fixes"
             cat /tmp/kernel-fixes-summary.md
             echo
           fi
         } > "$SUMMARY_FILE"
-
-    - name: Upload Build Summary Artifact
-      if: ${{ always() }}
-      uses: actions/upload-artifact@v7
-      with:
-        name: ${{ env.SUMMARY_BASE }}-Summary
-        path: /tmp/build-summary-${{ env.SUMMARY_BASE }}.md
-        if-no-files-found: ignore
-        compression-level: 9
 
     - name: Upload Artifacts
       id: kernel-artifact
@@ -554,42 +621,83 @@ jobs:
         compression-level: 9
 
     - name: Write Build-verified only artifact metadata
-      if: ${{ success() && inputs.root_flavor != '' && inputs.nomount_commit != '' }}
+      if: success() && inputs.root_flavor != ''
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
 
-        metadata_file="${{ github.workspace }}/${{ steps.extract.outputs.file_name }}-metadata.json"
+        # NoMount is optional: only resolve its artifact when requested.
+        # (nomount_commit input is always populated, so feature_set is the
+        # only reliable signal for whether NoMount was integrated.)
+        NOMOUNT_ENABLED="false"
+        if [ "${{ contains(inputs.feature_set, 'NoMount') || inputs.feature_set == 'All' }}" = "true" ]; then
+          NOMOUNT_ENABLED="true"
+        fi
+
+        if [ "$NOMOUNT_ENABLED" = "true" ]; then
+          METHOD="GKI source build with SHA-pinned root implementation, SUSFS, and NoMount"
+          NOMOUNT_MODULE_COMMIT="${{ inputs.nomount_commit }}"
+        else
+          METHOD="GKI source build with SHA-pinned root implementation and SUSFS"
+          NOMOUNT_MODULE_COMMIT="N/A"
+        fi
+
+        metadata_file="/tmp/${SUMMARY_BASE}-metadata.json"
+        summary_file="/tmp/build-summary-${SUMMARY_BASE}.md"
         artifacts_api="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100"
-        artifacts_json="$(curl --fail --silent --show-error \
-          --header "Authorization: Bearer ${GH_TOKEN}" \
-          --header "X-GitHub-Api-Version: 2022-11-28" \
-          "$artifacts_api")"
 
         resolve_artifact() {
           local artifact_name="$1"
-          local matches
-          matches="$(jq --arg name "$artifact_name" \
-            '[.artifacts[] | select(.name == $name and .expired == false)]' \
-            <<<"$artifacts_json")"
-          if [ "$(jq 'length' <<<"$matches")" -ne 1 ]; then
+          local page=1
+          local match=""
+          local page_file
+          page_file="$(mktemp)"
+
+          # Page through the artifacts API, checking each page for the exact
+          # artifact name. Uses a temp file for jq input (not argv) so large
+          # artifact lists can't exceed the OS argument-length limit.
+          while :; do
+            curl --fail --silent --show-error --location \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "${artifacts_api}&page=${page}" -o "$page_file"
+
+            match="$(jq -r --arg name "$artifact_name" \
+              '[.artifacts[] | select(.name == $name and .expired == false)] | .[0]
+               | if . == null then "" else (.archive_download_url + "\t" + .digest) end' \
+              "$page_file")"
+
+            items="$(jq '(.artifacts | length) // 0' "$page_file")"
+            if [ "$items" -lt 100 ] || [ -n "$match" ]; then
+              break
+            fi
+            page=$((page + 1))
+          done
+
+          rm -f "$page_file"
+          if [ -z "$match" ]; then
             echo "Expected exactly one available artifact named ${artifact_name}." >&2
             exit 1
           fi
-          jq -r '.[0] | [.archive_download_url, .digest] | @tsv' <<<"$matches"
+          printf '%s\n' "$match"
         }
 
         read -r kernel_artifact_url kernel_artifact_sha256 < <(
           resolve_artifact "${{ steps.extract.outputs.file_name }}-AnyKernel3"
         )
-        read -r nomount_module_url nomount_module_sha256 < <(
-          resolve_artifact "NoMount-Metamodule"
-        )
+        if [ "$NOMOUNT_ENABLED" = "true" ]; then
+          read -r nomount_module_url nomount_module_sha256 < <(
+            resolve_artifact "NoMount-Metamodule"
+          )
+        else
+          nomount_module_url="N/A"
+          nomount_module_sha256="N/A"
+        fi
 
         jq -n \
-          --arg method "GKI source build with SHA-pinned root implementation, SUSFS, and NoMount" \
+          --arg method "$METHOD" \
           --arg root_implementation "${ROOT_IMPLEMENTATION:-KernelSU-Next (legacy path)}" \
           --arg root_manager "${ROOT_MANAGER:-KernelSU-Next Manager}" \
           --arg root_version "${ROOT_VERSION:-${KSU_GIT_TAG:-N/A}}" \
@@ -602,7 +710,7 @@ jobs:
           --arg provenance_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
           --arg artifact_url "$kernel_artifact_url" \
           --arg sha256 "$kernel_artifact_sha256" \
-          --arg nomount_module_commit "${{ inputs.nomount_commit }}" \
+          --arg nomount_module_commit "$NOMOUNT_MODULE_COMMIT" \
           --arg nomount_module_url "$nomount_module_url" \
           --arg nomount_module_sha256 "$nomount_module_sha256" \
           --arg status "Build-verified only" \
@@ -645,24 +753,46 @@ jobs:
           (.root.manager | length > 0) and
           (.root.version | length > 0) and
           (.susfs_revision | test("^[0-9a-f]{40}$")) and
-          (.nomount_commit | test("^[0-9a-f]{40}$")) and
           (.kernel_source_commit | test("^[0-9a-f]{40}$")) and
           (.artifact_url | startswith("https://")) and
           (.sha256 | test("^sha256:[0-9a-f]{64}$")) and
-          (.nomount_metamodule.commit == .nomount_commit) and
-          (.nomount_metamodule.artifact_url | startswith("https://")) and
-          (.nomount_metamodule.sha256 | test("^sha256:[0-9a-f]{64}$")) and
           .catalog.availability == "eligible-with-provenance-and-checksums" and
           .catalog.device_compatibility == "not-validated" and
           .catalog.flashability == "not-guaranteed" and
           .catalog.boot == "not-guaranteed"
         ' "$metadata_file" > /dev/null
+        if [ "$NOMOUNT_ENABLED" = "true" ]; then
+          jq -e '
+            (.nomount_commit | test("^[0-9a-f]{40}$")) and
+            (.nomount_metamodule.commit == .nomount_commit) and
+            (.nomount_metamodule.artifact_url | startswith("https://")) and
+            (.nomount_metamodule.sha256 | test("^sha256:[0-9a-f]{64}$"))
+          ' "$metadata_file" > /dev/null
+        else
+          jq -e '
+            (.nomount_commit == "N/A") and
+            (.nomount_metamodule.commit == "N/A") and
+            (.nomount_metamodule.artifact_url == "N/A") and
+            (.nomount_metamodule.sha256 == "N/A")
+          ' "$metadata_file" > /dev/null
+        fi
 
-    - name: Upload Build-verified only artifact metadata
-      if: ${{ success() && inputs.root_flavor != '' && inputs.nomount_commit != '' }}
+        # Merge the verified metadata into the combined summary markdown so both
+        # live in a single artifact: human-readable table + machine JSON block.
+        {
+          echo
+          echo "## Verified Metadata"
+          echo
+          echo '```json'
+          cat "$metadata_file"
+          echo '```'
+          echo
+        } >> "$summary_file"
+
+    - name: Upload Build Summary + Metadata
       uses: actions/upload-artifact@v7
       with:
-        name: ${{ steps.extract.outputs.file_name }}-Metadata
-        path: ${{ github.workspace }}/${{ steps.extract.outputs.file_name }}-metadata.json
-        if-no-files-found: error
+        name: ${{ steps.extract.outputs.file_name }}-BuildInfo
+        path: /tmp/build-summary-${{ env.SUMMARY_BASE }}.md
+        if-no-files-found: warn
         compression-level: 9
