@@ -83,3 +83,5 @@ runs:
           CONFIG_SQUASHFS=y
           CONFIG_SQUASHFS_XZ=y
           CONFIG_SQUASHFS_ZSTD=y
+          CONFIG_BPF_LSM=y
+          CONFIG_BPF_UNPRIV_DEFAULT_OFF=y
