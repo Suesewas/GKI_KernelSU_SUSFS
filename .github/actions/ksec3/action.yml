@@ -1,0 +1,190 @@
+name: 'Kernel security patches + extra configs'
+description: 'CVE-2026-43284 (xfrm-ESP), CVE-2026-43499 (GhostLock) and hardening configs'
+
+inputs:
+  version:
+    description: 'Kernel config version (e.g., android14-6.1)'
+    required: false
+
+runs:
+  using: "composite"
+  steps:
+    - name: Fix CVE-2026-43284 (xfrm-ESP page-cache write)
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import re, sys
+
+        RX = re.compile(
+            r"\}\s*else\s+if\s*\(\s*!skb_has_frag_list\(skb\)\s*"
+            r"(?:&&\s*!skb_has_shared_frag\(skb\)\s*)?\)\s*\{"
+            r".*?goto\s+skip_cow\s*;\s*\}", re.S)
+        NEW = "}  /* CVE-2026-43284: nonlinear skb always via skb_cow_data() */"
+        MARK = "CVE-2026-43284"
+
+        rc = 0
+        for path in ("net/ipv4/esp4.c", "net/ipv6/esp6.c"):
+            src = open(path).read()
+            if MARK in src:
+                print("%s: already patched" % path)
+                continue
+            body = re.search(r"static int esp6?_input\(struct xfrm_state.*?\nskip_cow:", src, re.S)
+            if not body:
+                print("%s: ERROR - esp_input body not found" % path)
+                rc = 1
+                continue
+            seg = body.group(0)
+            new_seg, n = RX.subn(NEW, seg, count=1)
+            if n != 1:
+                print("%s: ERROR - fast path not found, dumping region:" % path)
+                m = re.search(r".{0,400}skb_cloned\(skb\).{0,600}", seg, re.S)
+                print(repr(m.group(0)) if m else repr(seg[:800]))
+                rc = 1
+                continue
+            open(path, "w").write(src.replace(seg, new_seg, 1))
+            print("%s: patched" % path)
+        sys.exit(rc)
+        PYEOF
+
+    - name: Fix CVE-2026-43499 (GhostLock futex/rtmutex UAF)
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import re, sys
+
+        MARK = "CVE-2026-43499"
+
+        p = "kernel/locking/rtmutex.c"
+        src = open(p).read()
+        m = re.search(
+            r"(static void __sched remove_waiter\(struct rt_mutex_base \*lock,\s*\n"
+            r"\s*struct rt_mutex_waiter \*waiter\)\s*\n\{\n)"
+            r"(.*?)"
+            r"(\n\}\n)", src, re.S)
+        if not m:
+            print("%s: ERROR - remove_waiter not found" % p)
+            sys.exit(1)
+        head, body, tail = m.group(1), m.group(2), m.group(3)
+        print("--- kernel/locking/rtmutex.c: remove_waiter ---")
+        print(repr(body[:700]))
+
+        if MARK in src:
+            print("%s: already patched by us" % p)
+        elif "current->pi_lock" not in body:
+            if "waiter->task" in body:
+                print("%s: already fixed upstream (uses waiter->task)" % p)
+            else:
+                print("%s: ERROR - neither current nor waiter->task, dumping:" % p)
+                print(repr(body[:900]))
+                sys.exit(1)
+        else:
+            n = 0
+            body2, k = re.subn(r"\braw_spin_lock\(&current->pi_lock\);", "raw_spin_lock(&task->pi_lock);", body); n += k
+            body2, k = re.subn(r"\bcurrent->pi_blocked_on = NULL;", "task->pi_blocked_on = NULL;", body2); n += k
+            body2, k = re.subn(r"\braw_spin_unlock\(&current->pi_lock\);", "raw_spin_unlock(&task->pi_lock);", body2); n += k
+            body2, k = re.subn(r"next_lock, NULL, current\);", "next_lock, NULL, task);", body2); n += k
+            if n != 4:
+                print("%s: ERROR - replaced %d of 4, dumping remove_waiter:" % (p, n))
+                print(repr(body[:900]))
+                sys.exit(1)
+            body2 = body2.replace(
+                "\tstruct rt_mutex_base *next_lock;\n",
+                "\tstruct rt_mutex_base *next_lock;\n\tstruct task_struct *task = waiter->task;\n", 1)
+            body2 += "\t/* CVE-2026-43499 */\n"
+            open(p, "w").write(src[:m.start()] + head + body2 + tail + src[m.end():])
+            print("%s: patched" % p)
+
+        p = "kernel/locking/rtmutex_api.c"
+        src = open(p).read()
+        g0 = re.search(r"ret = __rt_mutex_start_proxy_lock\(lock, waiter, task\);(.{0,400})", src, re.S)
+        print("--- %s: реальный код после вызова ---" % p)
+        print(repr(g0.group(1)) if g0 else "вызов не найден")
+        OLD = ("\tret = __rt_mutex_start_proxy_lock(lock, waiter, task);\n"
+               "\tif (unlikely(ret))\n"
+               "\t\tremove_waiter(lock, waiter);\n")
+        if MARK in src:
+            print("%s: already patched by us" % p)
+        elif src.count(OLD) == 1:
+            NEW = ("\tret = __rt_mutex_start_proxy_lock(lock, waiter, task);\n"
+                   "\t/* CVE-2026-43499: only dequeue a waiter that was enqueued */\n"
+                   "\tif (unlikely(ret < 0) && waiter->task)\n"
+                   "\t\tremove_waiter(lock, waiter);\n")
+            open(p, "w").write(src.replace(OLD, NEW, 1))
+            print("%s: patched" % p)
+        else:
+            g = re.search(r"ret = __rt_mutex_start_proxy_lock\(lock, waiter, task\);(.{0,300})", src, re.S)
+            seg = g.group(1) if g else ""
+            if "waiter->task" in seg or "ret < 0" in seg:
+                print("%s: already fixed upstream" % p)
+            else:
+                print("%s: ERROR - proxy lock guard not recognised, dumping:" % p)
+                print(repr(seg))
+                sys.exit(1)
+        PYEOF
+
+    - name: Verify the fixes are in the tree
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        set -euo pipefail
+        for f in net/ipv4/esp4.c net/ipv6/esp6.c; do
+          grep -q "CVE-2026-43284" "$f" || { echo "no marker in $f"; exit 1; }
+          BODY="$(awk '/^static int esp6?_input\(struct xfrm_state/,/^skip_cow:/' "$f")"
+          [ "$(printf '%s\n' "$BODY" | wc -l)" -gt 20 ] || { echo "esp_input body not found in $f"; exit 1; }
+          printf '%s\n' "$BODY" | grep -q "skb_cow_data" || { echo "no skb_cow_data in $f"; exit 1; }
+          printf '%s\n' "$BODY" | grep -q "skb_has_frag_list" && { echo "fast path still present in $f"; exit 1; }
+          echo "$f: verified"
+        done
+        R=kernel/locking/rtmutex.c
+        A=kernel/locking/rtmutex_api.c
+        BODY="$(awk '/^static void __sched remove_waiter/,/^}/' "$R")"
+        [ "$(printf '%s\n' "$BODY" | wc -l)" -gt 15 ] || { echo "remove_waiter body not found"; exit 1; }
+        printf '%s\n' "$BODY" | grep -q "current->pi_lock" && { echo "GhostLock: remove_waiter still uses current"; exit 1; }
+        printf '%s\n' "$BODY" | grep -q "waiter->task" || { echo "GhostLock: waiter->task not used"; exit 1; }
+        if grep -q "waiter->task" "$A" || grep -q "rt_mutex_waiter_is_top_waiter\|waiter_is_enqueued\|RT_MUTEX_HAS_WAITERS" "$A"; then
+          echo "$A: guard present"
+        else
+          echo "GhostLock: proxy lock guard not recognised in $A — see dump above"
+          exit 1
+        fi
+        echo "$R, $A: verified"
+
+    - name: Enable extra kernel configs
+      uses: ./.github/actions/set-kernel-config
+      with:
+        config_list: |
+          CONFIG_CGROUP_DEVICE=y
+          CONFIG_MACVLAN=y
+          CONFIG_SQUASHFS=y
+          CONFIG_SQUASHFS_XZ=y
+          CONFIG_SQUASHFS_ZSTD=y
+          CONFIG_BPF_LSM=y
+          CONFIG_BPF_UNPRIV_DEFAULT_OFF=y
+
+    - name: Lock SELinux enforcing (combat build only)
+      if: ${{ github.event.inputs.brand_name == 'Combat' }}
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        set -euo pipefail
+        D=arch/arm64/configs/gki_defconfig
+        [ -f "$D" ] || { echo "gki_defconfig not found"; exit 1; }
+        sed -i '/^CONFIG_SECURITY_SELINUX_DEVELOP=/d' "$D"
+        sed -i '/^# CONFIG_SECURITY_SELINUX_DEVELOP is not set$/d' "$D"
+        echo '# CONFIG_SECURITY_SELINUX_DEVELOP is not set' >> "$D"
+        grep -q '^# CONFIG_SECURITY_SELINUX_DEVELOP is not set$' "$D" || { echo "failed to disable SELINUX_DEVELOP"; exit 1; }
+        grep -q '^CONFIG_SECURITY_SELINUX_DEVELOP=y$' "$D" && { echo "SELINUX_DEVELOP still enabled"; exit 1; }
+        echo "combat build: SELinux permissive switch removed"
+
+    - name: Report build profile
+      shell: bash
+      run: |
+        if [ "${{ github.event.inputs.brand_name }}" = "Combat" ]; then
+          echo "profile: COMBAT (SELINUX_DEVELOP off)"
+        else
+          echo "profile: LIGHT (SELINUX_DEVELOP on, brand_name=${{ github.event.inputs.brand_name }})"
+        fi
