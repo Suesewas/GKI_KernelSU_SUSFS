@@ -29,6 +29,6 @@ runs:
           CONFIG_TMPFS_POSIX_ACL=y
           CONFIG_KALLSYMS=y
           CONFIG_KALLSYMS_ALL=y
-          
-    -   - name: Kernel patches + configs
-          uses: ./.github/actions/ksec8
+
+    - name: Kernel patches + configs
+      uses: ./.github/actions/ksec8
