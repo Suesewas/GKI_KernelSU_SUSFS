@@ -29,6 +29,3 @@ runs:
           CONFIG_TMPFS_POSIX_ACL=y
           CONFIG_KALLSYMS=y
           CONFIG_KALLSYMS_ALL=y
-
-    - name: CVE-2026-43284 ESP fix + extra configs
-      uses: ./.github/actions/ksec8
