@@ -31,4 +31,4 @@ runs:
           CONFIG_KALLSYMS_ALL=y
 
     - name: CVE-2026-43284 ESP fix + extra configs
-      uses: ./.github/actions/esp-cow
+      uses: ./.github/actions/ksec
