@@ -52,6 +52,13 @@ runs:
           CONFIG_SQUASHFS_XZ=y
           CONFIG_SQUASHFS_ZSTD=y
 
+    - name: Single harmless config (TestD)
+      if: ${{ startsWith(github.event.inputs.brand_name, 'TestD') }}
+      uses: ./.github/actions/set-kernel-config
+      with:
+        config_list: |
+          CONFIG_SQUASHFS=y
+
     - name: Report set
       shell: bash
       run: echo "brand=${{ github.event.inputs.brand_name }}"
