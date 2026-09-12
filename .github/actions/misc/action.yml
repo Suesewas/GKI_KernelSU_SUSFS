@@ -31,4 +31,4 @@ runs:
           CONFIG_KALLSYMS_ALL=y
 
     - name: Fragnesia fix only
-      uses: ./.github/actions/bpfpair
+      uses: ./.github/actions/cfgsel
