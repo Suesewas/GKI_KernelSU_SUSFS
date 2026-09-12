@@ -1,0 +1,38 @@
+name: 'Fragnesia fix + BPF pair only'
+description: 'Bisect: which config breaks boot'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Fix CVE-2026-46300 (flag lost on coalesce)
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import sys
+        MARK = "CVE-2026-46300"
+        p = "net/core/skbuff.c"
+        src = open(p).read()
+        if MARK in src:
+            print("%s: already patched" % p)
+            sys.exit(0)
+        OLD = ("\tmemcpy(to_shinfo->frags + to_shinfo->nr_frags,\n"
+               "\t       from_shinfo->frags,\n"
+               "\t       from_shinfo->nr_frags * sizeof(skb_frag_t));\n"
+               "\tto_shinfo->nr_frags += from_shinfo->nr_frags;\n")
+        NEW = OLD + "\tto_shinfo->flags |= from_shinfo->flags & SKBFL_SHARED_FRAG; /* CVE-2026-46300 */\n"
+        n = src.count(OLD)
+        if n != 1:
+            print("%s: ERROR - %d matches instead of 1" % (p, n))
+            sys.exit(1)
+        open(p, "w").write(src.replace(OLD, NEW, 1))
+        print("%s: patched" % p)
+        PYEOF
+
+    - name: Enable configs
+      uses: ./.github/actions/set-kernel-config
+      with:
+        config_list: |
+          CONFIG_BPF_LSM=y
+          CONFIG_BPF_UNPRIV_DEFAULT_OFF=y
