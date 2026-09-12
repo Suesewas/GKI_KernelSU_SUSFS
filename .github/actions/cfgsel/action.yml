@@ -99,6 +99,38 @@ runs:
           CONFIG_SQUASHFS_XZ=y
           CONFIG_SQUASHFS_ZSTD=y
 
+    - name: Fragnesia segment half (Full*)
+      if: ${{ startsWith(github.event.inputs.brand_name, 'Full') }}
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import sys
+        p = "net/core/skbuff.c"
+        src = open(p).read()
+        if "CVE-2026-46300-seg" in src:
+            print("%s: already patched" % p); sys.exit(0)
+
+        OLD1 = "\t\t\t\tfrag_skb = list_skb;\n"
+        NEW1 = OLD1 + "\t\t\t\tskb_shinfo(nskb)->flags |= skb_shinfo(frag_skb)->flags & SKBFL_SHARED_FRAG; /* CVE-2026-46300-seg */\n"
+        if src.count(OLD1) != 1:
+            print("ERROR: inner-loop site matched %d times" % src.count(OLD1)); sys.exit(1)
+        src = src.replace(OLD1, NEW1, 1)
+
+        OLD2 = ("\t\tskb_shinfo(nskb)->flags |= skb_shinfo(head_skb)->flags &\n"
+                "\t\t\t\t\t   SKBFL_SHARED_FRAG;\n")
+        NEW2 = ("\t\tskb_shinfo(nskb)->flags |= (skb_shinfo(head_skb)->flags |\n"
+                "\t\t\t\t\t    skb_shinfo(frag_skb)->flags) &\n"
+                "\t\t\t\t\t   SKBFL_SHARED_FRAG; /* CVE-2026-46300-seg2 */\n")
+        if src.count(OLD2) != 1:
+            print("ERROR: nskb-creation site matched %d times" % src.count(OLD2)); sys.exit(1)
+        src = src.replace(OLD2, NEW2, 1)
+
+        open(p, "w").write(src)
+        print("%s: segment half patched" % p)
+        PYEOF
+
     - name: Report set
       shell: bash
       run: echo "brand=${{ github.event.inputs.brand_name }}"
