@@ -59,6 +59,46 @@ runs:
         config_list: |
           CONFIG_SQUASHFS=y
 
+    - name: Probe TestE
+      if: ${{ startsWith(github.event.inputs.brand_name, 'TestE') }}
+      uses: ./.github/actions/set-kernel-config
+      with:
+        config_list: |
+          CONFIG_BPF_LSM=y
+
+    - name: Probe TestF
+      if: ${{ startsWith(github.event.inputs.brand_name, 'TestF') }}
+      uses: ./.github/actions/set-kernel-config
+      with:
+        config_list: |
+          CONFIG_BPF_UNPRIV_DEFAULT_OFF=y
+
+    - name: Probe TestG
+      if: ${{ startsWith(github.event.inputs.brand_name, 'TestG') }}
+      uses: ./.github/actions/set-kernel-config
+      with:
+        config_list: |
+          CONFIG_INIT_ON_FREE_DEFAULT_ON=y
+
+    - name: Probe TestH
+      if: ${{ startsWith(github.event.inputs.brand_name, 'TestH') }}
+      uses: ./.github/actions/set-kernel-config
+      with:
+        config_list: |
+          CONFIG_RANDOMIZE_KSTACK_OFFSET_DEFAULT=y
+          CONFIG_SECURITY_DMESG_RESTRICT=y
+
+    - name: Probe TestI
+      if: ${{ startsWith(github.event.inputs.brand_name, 'TestI') }}
+      uses: ./.github/actions/set-kernel-config
+      with:
+        config_list: |
+          CONFIG_CGROUP_DEVICE=y
+          CONFIG_MACVLAN=y
+          CONFIG_SQUASHFS=y
+          CONFIG_SQUASHFS_XZ=y
+          CONFIG_SQUASHFS_ZSTD=y
+
     - name: Report set
       shell: bash
       run: echo "brand=${{ github.event.inputs.brand_name }}"
