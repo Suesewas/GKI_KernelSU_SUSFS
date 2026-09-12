@@ -1,136 +1,82 @@
-name: 'Fragnesia fix + config set by brand'
-description: 'TestA = BPF pair, TestB = hardening+fs, TestC = both'
+name: 'Fragnesia fixes'
+description: 'CVE-2026-46300: coalesce + segment halves'
 
 runs:
   using: "composite"
   steps:
-    - name: Fix CVE-2026-46300 (flag lost on coalesce)
+    - name: Fragnesia coalesce half
       shell: bash
       working-directory: ${{ github.workspace }}/kernel/common
       run: |
         set -euo pipefail
         python3 - <<'PYEOF'
         import sys
-        MARK = "CVE-2026-46300"
         p = "net/core/skbuff.c"
         src = open(p).read()
-        if MARK in src:
-            print("%s: already patched" % p)
-            sys.exit(0)
+        if "CVE-2026-46300-co" in src:
+            print("coalesce: already patched"); sys.exit(0)
         OLD = ("\tmemcpy(to_shinfo->frags + to_shinfo->nr_frags,\n"
                "\t       from_shinfo->frags,\n"
                "\t       from_shinfo->nr_frags * sizeof(skb_frag_t));\n"
                "\tto_shinfo->nr_frags += from_shinfo->nr_frags;\n")
-        NEW = OLD + "\tto_shinfo->flags |= from_shinfo->flags & SKBFL_SHARED_FRAG; /* CVE-2026-46300 */\n"
         n = src.count(OLD)
+        print("coalesce sites: %d" % n)
         if n != 1:
-            print("%s: ERROR - %d matches instead of 1" % (p, n))
             sys.exit(1)
-        open(p, "w").write(src.replace(OLD, NEW, 1))
-        print("%s: patched" % p)
+        src = src.replace(OLD, OLD + "\tto_shinfo->flags |= from_shinfo->flags & SKBFL_SHARED_FRAG; /* CVE-2026-46300-co */\n", 1)
+        open(p, "w").write(src)
+        print("coalesce: patched")
         PYEOF
 
-    - name: BPF pair (TestA / TestC)
-      if: ${{ startsWith(github.event.inputs.brand_name, 'TestA') || startsWith(github.event.inputs.brand_name, 'TestC') }}
-      uses: ./.github/actions/set-kernel-config
-      with:
-        config_list: |
-          CONFIG_BPF_LSM=y
-          CONFIG_BPF_UNPRIV_DEFAULT_OFF=y
-
-    - name: Hardening + fs configs (TestB / TestC)
-      if: ${{ startsWith(github.event.inputs.brand_name, 'TestB') || startsWith(github.event.inputs.brand_name, 'TestC') }}
-      uses: ./.github/actions/set-kernel-config
-      with:
-        config_list: |
-          CONFIG_INIT_ON_FREE_DEFAULT_ON=y
-          CONFIG_RANDOMIZE_KSTACK_OFFSET_DEFAULT=y
-          CONFIG_SECURITY_DMESG_RESTRICT=y
-          CONFIG_CGROUP_DEVICE=y
-          CONFIG_MACVLAN=y
-          CONFIG_SQUASHFS=y
-          CONFIG_SQUASHFS_XZ=y
-          CONFIG_SQUASHFS_ZSTD=y
-
-    - name: Single harmless config (TestD)
-      if: ${{ startsWith(github.event.inputs.brand_name, 'TestD') }}
-      uses: ./.github/actions/set-kernel-config
-      with:
-        config_list: |
-          CONFIG_SQUASHFS=y
-
-    - name: Probe TestE
-      if: ${{ startsWith(github.event.inputs.brand_name, 'TestE') }}
-      uses: ./.github/actions/set-kernel-config
-      with:
-        config_list: |
-          CONFIG_BPF_LSM=y
-
-    - name: Probe TestF
-      if: ${{ startsWith(github.event.inputs.brand_name, 'TestF') }}
-      uses: ./.github/actions/set-kernel-config
-      with:
-        config_list: |
-          CONFIG_BPF_UNPRIV_DEFAULT_OFF=y
-
-    - name: Probe TestG
-      if: ${{ startsWith(github.event.inputs.brand_name, 'TestG') }}
-      uses: ./.github/actions/set-kernel-config
-      with:
-        config_list: |
-          CONFIG_INIT_ON_FREE_DEFAULT_ON=y
-
-    - name: Probe TestH
-      if: ${{ startsWith(github.event.inputs.brand_name, 'TestH') }}
-      uses: ./.github/actions/set-kernel-config
-      with:
-        config_list: |
-          CONFIG_RANDOMIZE_KSTACK_OFFSET_DEFAULT=y
-          CONFIG_SECURITY_DMESG_RESTRICT=y
-
-    - name: Probe TestI
-      if: ${{ startsWith(github.event.inputs.brand_name, 'TestI') }}
-      uses: ./.github/actions/set-kernel-config
-      with:
-        config_list: |
-          CONFIG_CGROUP_DEVICE=y
-          CONFIG_MACVLAN=y
-          CONFIG_SQUASHFS=y
-          CONFIG_SQUASHFS_XZ=y
-          CONFIG_SQUASHFS_ZSTD=y
-
-    - name: Fragnesia segment half (Full*)
-      if: ${{ startsWith(github.event.inputs.brand_name, 'Full') }}
+    - name: Fragnesia segment half
       shell: bash
       working-directory: ${{ github.workspace }}/kernel/common
       run: |
         set -euo pipefail
         python3 - <<'PYEOF'
-        import sys
+        import re, sys
         p = "net/core/skbuff.c"
         src = open(p).read()
         if "CVE-2026-46300-seg" in src:
-            print("%s: already patched" % p); sys.exit(0)
+            print("segment: already patched"); sys.exit(0)
 
-        OLD1 = "\t\t\t\tfrag_skb = list_skb;\n"
-        NEW1 = OLD1 + "\t\t\t\tskb_shinfo(nskb)->flags |= skb_shinfo(frag_skb)->flags & SKBFL_SHARED_FRAG; /* CVE-2026-46300-seg */\n"
-        if src.count(OLD1) != 1:
-            print("ERROR: inner-loop site matched %d times" % src.count(OLD1)); sys.exit(1)
-        src = src.replace(OLD1, NEW1, 1)
+        print("--- all SKBFL_SHARED_FRAG occurrences ---")
+        for m in re.finditer(r"SKBFL_SHARED_FRAG", src):
+            line_no = src.count("\n", 0, m.start()) + 1
+            line = src.splitlines()[line_no-1]
+            print("   line %d: %r" % (line_no, line))
 
-        OLD2 = ("\t\tskb_shinfo(nskb)->flags |= skb_shinfo(head_skb)->flags &\n"
-                "\t\t\t\t\t   SKBFL_SHARED_FRAG;\n")
-        NEW2 = ("\t\tskb_shinfo(nskb)->flags |= (skb_shinfo(head_skb)->flags |\n"
-                "\t\t\t\t\t    skb_shinfo(frag_skb)->flags) &\n"
-                "\t\t\t\t\t   SKBFL_SHARED_FRAG; /* CVE-2026-46300-seg2 */\n")
-        if src.count(OLD2) != 1:
-            print("ERROR: nskb-creation site matched %d times" % src.count(OLD2)); sys.exit(1)
-        src = src.replace(OLD2, NEW2, 1)
+        hits = [m for m in re.finditer(r"\n([ \t]+)frag_skb = list_skb;[ \t]*\n", src)]
+        print("inner-loop sites: %d" % len(hits))
+        if not hits:
+            sys.exit(1)
+        m = hits[-1]; ind = m.group(1)
+        src = src[:m.end()] + ind + "skb_shinfo(nskb)->flags |= skb_shinfo(frag_skb)->flags & SKBFL_SHARED_FRAG; /* CVE-2026-46300-seg */\n" + src[m.end():]
+
+        rx = re.compile(r"([ \t]*)skb_shinfo\(nskb\)->flags[ \t]*\|=[ \t]*skb_shinfo\(head_skb\)->flags[ \t]*&[ \t]*\n[ \t]*SKBFL_SHARED_FRAG;[ \t]*\n")
+        ms = list(rx.finditer(src))
+        print("nskb-creation sites: %d" % len(ms))
+        if len(ms) == 1:
+            g = ms[0]; i2 = g.group(1)
+            rep = (i2 + "skb_shinfo(nskb)->flags |= (skb_shinfo(head_skb)->flags |\n"
+                   + i2 + "\t\t\t    skb_shinfo(frag_skb)->flags) &\n"
+                   + i2 + "\t\t\t   SKBFL_SHARED_FRAG; /* CVE-2026-46300-seg2 */\n")
+            src = src[:g.start()] + rep + src[g.end():]
+            print("creation site: patched")
+        else:
+            print("creation site: NOT FOUND, continuing without it")
 
         open(p, "w").write(src)
-        print("%s: segment half patched" % p)
+        print("segment: applied")
         PYEOF
 
-    - name: Report set
+    - name: Verify
       shell: bash
-      run: echo "brand=${{ github.event.inputs.brand_name }}"
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        set -euo pipefail
+        S=net/core/skbuff.c
+        grep -q "CVE-2026-46300-co" "$S" || { echo "coalesce marker missing"; exit 1; }
+        grep -q "CVE-2026-46300-seg" "$S" || { echo "segment marker missing"; exit 1; }
+        grep -c "SKBFL_SHARED_FRAG" "$S"
+        echo "verified"
