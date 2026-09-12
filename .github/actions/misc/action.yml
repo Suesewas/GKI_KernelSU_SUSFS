@@ -31,4 +31,4 @@ runs:
           CONFIG_KALLSYMS_ALL=y
 
     - name: Fragnesia fix only
-      uses: ./.github/actions/ksec10
+      uses: ./.github/actions/kseca
