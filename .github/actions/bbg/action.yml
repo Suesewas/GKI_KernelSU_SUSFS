@@ -14,6 +14,15 @@ runs:
         delay: 5
         workdir: ${{ github.workspace }}/kernel
     
+    - name: Allow devinfo writes
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/Baseband-guard
+      run: |
+        set -e
+        grep -q '"devinfo"' baseband_guard.h || \
+          sed -i 's/"userdata", "cache", "metadata", "misc",/"userdata", "cache", "metadata", "misc", "devinfo",/' baseband_guard.h
+        grep -n devinfo baseband_guard.h
+
     - name: Configure Baseband Guard
       shell: bash
       working-directory: ${{ github.workspace }}/kernel
