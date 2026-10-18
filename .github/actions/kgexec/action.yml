@@ -1,0 +1,13 @@
+name: 'Apply kGuard Execmem Patch'
+description: 'Deny anonymous and out-of-tree executable mappings for listed app ids'
+
+runs:
+  using: composite
+  steps:
+    - name: Apply kgexec patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 "${{ github.workspace }}/.github/kgexec/apply.py" \
+          "${{ github.workspace }}/kernel/common" \
+          "${{ github.workspace }}/.github/kgexec"

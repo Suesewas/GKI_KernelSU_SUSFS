@@ -318,6 +318,10 @@ jobs:
         kernel_version: ${{ inputs.kernel_version }}
         sublevel: ${{ steps.extract.outputs.sublevel }}
 
+    - name: Apply kGuard Execmem Patch
+      if: contains(inputs.feature_set, 'KGExec')
+      uses: ./.github/actions/kgexec
+
     - name: Apply Device-Specific Patches
       uses: ./.github/actions/apply-device-patches
       with:

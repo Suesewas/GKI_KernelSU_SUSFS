@@ -103,6 +103,10 @@ on:
         description: "Performance"
         type: boolean
         default: false
+      use_kgexec:
+        description: "kGuard Execmem (deny DCL per app id)"
+        type: boolean
+        default: true
       test_release_notes:
         description: "Render release notes preview only (skip all builds + release)"
         type: boolean
@@ -420,6 +424,7 @@ jobs:
           [ "${{ inputs.use_unicode }}" = "true" ] && FEATURES="${FEATURES}Unicode+"
           [ "${{ inputs.use_bpf }}" = "true" ] && FEATURES="${FEATURES}BPF+"
           [ "${{ inputs.use_perf }}" = "true" ] && FEATURES="${FEATURES}Perf+"
+          [ "${{ inputs.use_kgexec }}" = "true" ] && FEATURES="${FEATURES}KGExec+"
           echo "feature_set=${FEATURES%+}" >> "$GITHUB_OUTPUT"
 
       - name: Clone shared source repos once
