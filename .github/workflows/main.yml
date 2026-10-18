@@ -1425,6 +1425,7 @@ jobs:
           USE_UNICODE: ${{ inputs.use_unicode }}
           USE_BPF: ${{ inputs.use_bpf }}
           USE_PERF: ${{ inputs.use_perf }}
+          USE_KGEXEC: ${{ inputs.use_kgexec }}
           USE_CACHE: ${{ inputs.use_cache }}
           KERNEL_BUILD_VERSION: ${{ inputs.kernel_build_version }}
           NOMOUNT_COMMIT: ${{ needs.resolve-sources.outputs.nomount_commit }}
@@ -1469,6 +1470,7 @@ jobs:
           if env("USE_UNICODE","true")=="true": feats.append("Unicode Fix")
           if env("USE_BPF","true")=="true": feats.append("BTF / eBPF / FUSE-BPF")
           if env("USE_PERF","false")=="true": feats.append("Performance Tuning")
+          if env("USE_KGEXEC","true")=="true": feats.append("kGuard Execmem")
           lines=[]
           lines.append("# Wild Kernels for GKI2 Devices")
           lines.append("")
