@@ -99,6 +99,8 @@ runs:
         if [ "${{ inputs.sublevel }}" -ge "157" ]; then
           echo "Applying namespace.c Android 14 6.1 Fake Patch"
           sed -i '/^#include <trace\/hooks\/blk.h>$/d' fs/namespace.c
+          echo "Applying super.c Android 14 6.1 Fake Patch"
+          sed -i '/^#include <trace\/hooks\/fs.h>$/,+1 d' fs/super.c
         fi
 
     - name: Apply Android 15 6.6 Fake Patches
@@ -143,7 +145,18 @@ runs:
       shell: bash
       working-directory: ${{ github.workspace }}/kernel/common
       run: |
-        patch -p1 < 50_add_susfs_in_gki-${{ inputs.version }}.patch
+        if ! patch -p1 < 50_add_susfs_in_gki-${{ inputs.version }}.patch; then
+          shown=0
+          for r in $(find . -name '*.rej' | head -3); do
+            echo "::error title=SUSFS reject::$r"
+            while IFS= read -r l; do
+              shown=$((shown+1))
+              [ "$shown" -gt 24 ] && break
+              echo "::error::${l//$'\r'/}"
+            done < <(head -10 "$r")
+          done
+          exit 1
+        fi
 
         # SUSFS's OPEN_REDIRECT code unconditionally calls VMA_PAD_START(), which
         # only exists on GKI branches that carry Google's page-size-migration

@@ -58,5 +58,16 @@ runs:
             mkdir -p "$(dirname "$LOCAL")"
             retry curl -fsSL -o "$LOCAL" "$PERSHOOT_RAW/$p"
           fi
-          patch -p1 < "$LOCAL"
+          if ! patch -p1 < "$LOCAL"; then
+            shown=0
+            for r in $(find . -name '*.rej' | head -3); do
+              echo "::error title=pershoot reject::$r"
+              while IFS= read -r l; do
+                shown=$((shown+1))
+                [ "$shown" -gt 24 ] && break
+                echo "::error::${l//$'\r'/}"
+              done < <(head -10 "$r")
+            done
+            exit 1
+          fi
         done
