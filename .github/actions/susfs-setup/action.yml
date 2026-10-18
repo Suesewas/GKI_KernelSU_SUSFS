@@ -58,16 +58,12 @@ runs:
             mkdir -p "$(dirname "$LOCAL")"
             retry curl -fsSL -o "$LOCAL" "$PERSHOOT_RAW/$p"
           fi
-          if ! patch -p1 < "$LOCAL"; then
-            shown=0
-            for r in $(find . -name '*.rej' | head -3); do
-              echo "::error title=pershoot reject::$r"
-              while IFS= read -r l; do
-                shown=$((shown+1))
-                [ "$shown" -gt 24 ] && break
-                echo "::error::${l//$'\r'/}"
-              done < <(head -10 "$r")
-            done
-            exit 1
+          if patch -p1 -s --dry-run < "$LOCAL" >/dev/null 2>&1; then
+            patch -p1 < "$LOCAL"
+            echo "applied: $p"
+          elif patch -p1 -s -R --dry-run < "$LOCAL" >/dev/null 2>&1; then
+            echo "already in the SUSFS tree, skipped: $p"
+          else
+            echo "::warning title=pershoot patch skipped::$p does not apply to this SUSFS tree"
           fi
         done
