@@ -12,6 +12,7 @@
 #include <linux/init.h>
 #include <linux/jump_label.h>
 #include <linux/kernel.h>
+#include <linux/magic.h>
 #include <linux/mm.h>
 #include <linux/mman.h>
 #include <linux/mutex.h>
@@ -87,11 +88,42 @@ static u8 kg_flags_now(void)
 	return flags;
 }
 
+static const char * const kg_jit_name[] = {
+	"memfd:jit-cache",
+	"memfd:jit-zygote-cache",
+};
+
+static bool kg_jit_file(struct file *file)
+{
+	struct inode *inode = file_inode(file);
+	const char *name;
+	size_t i;
+
+	if (!inode || !inode->i_sb || inode->i_sb->s_magic != TMPFS_MAGIC)
+		return false;
+	if (!file->f_path.dentry)
+		return false;
+
+	name = (const char *)file->f_path.dentry->d_name.name;
+	if (!name)
+		return false;
+
+	for (i = 0; i < ARRAY_SIZE(kg_jit_name); i++) {
+		if (strncmp(name, kg_jit_name[i], strlen(kg_jit_name[i])) == 0)
+			return true;
+	}
+
+	return false;
+}
+
 static bool kg_path_ok(struct file *file)
 {
 	char *buf, *p;
 	bool ok = false;
 	size_t i;
+
+	if (kg_jit_file(file))
+		return true;
 
 	buf = (char *)__get_free_page(GFP_KERNEL);
 	if (!buf)
