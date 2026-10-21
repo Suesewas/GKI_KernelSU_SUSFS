@@ -26,6 +26,7 @@
 
 #include <linux/kg_execmem.h>
 
+#define KG_ABI		2
 #define KG_MAX_APPS	512
 #define KG_APP_MIN	10000
 #define KG_APP_MAX	19999
@@ -372,6 +373,7 @@ static ssize_t kg_proc_read(struct file *file, char __user *ubuf,
 
 	mutex_lock(&kg_lock);
 	t = rcu_dereference_protected(kg_table, lockdep_is_held(&kg_lock));
+	n += scnprintf(out + n, KG_OUT_MAX - n, "abi %d\n", KG_ABI);
 	n += scnprintf(out + n, KG_OUT_MAX - n, "sealed %d\n", kg_sealed ? 1 : 0);
 	n += scnprintf(out + n, KG_OUT_MAX - n, "count %d\n", t ? t->count : 0);
 	if (t) {
