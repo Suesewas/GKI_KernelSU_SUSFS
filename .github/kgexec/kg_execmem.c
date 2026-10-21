@@ -19,6 +19,7 @@
 #include <linux/printk.h>
 #include <linux/proc_fs.h>
 #include <linux/rcupdate.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
@@ -26,14 +27,15 @@
 
 #include <linux/kg_execmem.h>
 
-#define KG_ABI		2
+#define KG_ABI		3
 #define KG_MAX_APPS	512
 #define KG_APP_MIN	10000
 #define KG_APP_MAX	19999
 #define KG_USER_OFF	100000
 #define KG_FLAG_MEM	1
 #define KG_FLAG_FILE	2
-#define KG_FLAG_ALL	(KG_FLAG_MEM | KG_FLAG_FILE)
+#define KG_FLAG_WATCH	4
+#define KG_FLAG_ALL	(KG_FLAG_MEM | KG_FLAG_FILE | KG_FLAG_WATCH)
 #define KG_CMD_MAX	64
 #define KG_OUT_MAX	8192
 
@@ -42,6 +44,7 @@ struct kg_table {
 	int count;
 	u32 id[KG_MAX_APPS];
 	u8 flags[KG_MAX_APPS];
+	u8 seen[KG_MAX_APPS];
 };
 
 DEFINE_STATIC_KEY_FALSE(kg_execmem_key);
@@ -89,6 +92,28 @@ static u8 kg_flags_now(void)
 	return flags;
 }
 
+static void kg_mark_seen(void)
+{
+	struct kg_table *t;
+	u32 appid;
+	int i;
+
+	appid = from_kuid(&init_user_ns, current_uid()) % KG_USER_OFF;
+
+	rcu_read_lock();
+	t = rcu_dereference(kg_table);
+	if (t) {
+		for (i = 0; i < t->count; i++) {
+			if (t->id[i] == appid) {
+				if (!READ_ONCE(t->seen[i]))
+					WRITE_ONCE(t->seen[i], 1);
+				break;
+			}
+		}
+	}
+	rcu_read_unlock();
+}
+
 static const char * const kg_jit_name[] = {
 	"memfd:jit-cache",
 	"memfd:jit-zygote-cache",
@@ -117,13 +142,13 @@ static bool kg_jit_file(struct file *file)
 	return false;
 }
 
-static bool kg_path_ok(struct file *file)
+static bool kg_path_ok(struct file *file, u8 flags)
 {
 	char *buf, *p;
 	bool ok = false;
 	size_t i;
 
-	if (kg_jit_file(file))
+	if (!(flags & KG_FLAG_MEM) && kg_jit_file(file))
 		return true;
 
 	buf = (char *)__get_free_page(GFP_KERNEL);
@@ -144,8 +169,9 @@ static bool kg_path_ok(struct file *file)
 	}
 
 	if (!ok)
-		pr_warn_ratelimited("uid %u exec map denied: %s\n",
-				    from_kuid(&init_user_ns, current_uid()), p);
+		pr_warn_ratelimited("uid %u comm %s exec map denied: %s\n",
+				    from_kuid(&init_user_ns, current_uid()),
+				    current->comm, p);
 
 	free_page((unsigned long)buf);
 	return ok;
@@ -163,17 +189,25 @@ bool kg_execmem_block_mmap(struct file *file, unsigned long prot)
 		return false;
 
 	if (!file) {
-		if (!(flags & KG_FLAG_MEM))
+		if (!(flags & KG_FLAG_MEM)) {
+			if (flags & KG_FLAG_WATCH) {
+				kg_mark_seen();
+				pr_info_ratelimited("uid %u comm %s anonymous exec map observed\n",
+						    from_kuid(&init_user_ns, current_uid()),
+						    current->comm);
+			}
 			return false;
-		pr_warn_ratelimited("uid %u anonymous exec map denied\n",
-				    from_kuid(&init_user_ns, current_uid()));
+		}
+		pr_warn_ratelimited("uid %u comm %s anonymous exec map denied\n",
+				    from_kuid(&init_user_ns, current_uid()),
+				    current->comm);
 		return true;
 	}
 
 	if (!(flags & KG_FLAG_FILE))
 		return false;
 
-	return !kg_path_ok(file);
+	return !kg_path_ok(file, flags);
 }
 
 bool kg_execmem_block_mprotect(struct vm_area_struct *vma,
@@ -189,17 +223,25 @@ bool kg_execmem_block_mprotect(struct vm_area_struct *vma,
 		return false;
 
 	if (!vma->vm_file) {
-		if (!(flags & KG_FLAG_MEM))
+		if (!(flags & KG_FLAG_MEM)) {
+			if (flags & KG_FLAG_WATCH) {
+				kg_mark_seen();
+				pr_info_ratelimited("uid %u comm %s anonymous exec remap observed\n",
+						    from_kuid(&init_user_ns, current_uid()),
+						    current->comm);
+			}
 			return false;
-		pr_warn_ratelimited("uid %u anonymous exec remap denied\n",
-				    from_kuid(&init_user_ns, current_uid()));
+		}
+		pr_warn_ratelimited("uid %u comm %s anonymous exec remap denied\n",
+				    from_kuid(&init_user_ns, current_uid()),
+				    current->comm);
 		return true;
 	}
 
 	if (!(flags & KG_FLAG_FILE))
 		return false;
 
-	return !kg_path_ok(vma->vm_file);
+	return !kg_path_ok(vma->vm_file, flags);
 }
 
 static struct kg_table *kg_clone(struct kg_table *old)
@@ -214,8 +256,10 @@ static struct kg_table *kg_clone(struct kg_table *old)
 		t->count = old->count;
 		memcpy(t->id, old->id, sizeof(t->id));
 		memcpy(t->flags, old->flags, sizeof(t->flags));
+		memcpy(t->seen, old->seen, sizeof(t->seen));
 	} else {
 		t->count = 0;
+		memset(t->seen, 0, sizeof(t->seen));
 	}
 
 	return t;
@@ -263,6 +307,7 @@ static int kg_add(u32 appid, u32 flags)
 	for (i = 0; i < t->count; i++) {
 		if (t->id[i] == appid) {
 			t->flags[i] = (u8)flags;
+			t->seen[i] = 0;
 			kg_publish(t);
 			mutex_unlock(&kg_lock);
 			return 0;
@@ -277,6 +322,7 @@ static int kg_add(u32 appid, u32 flags)
 
 	t->id[t->count] = appid;
 	t->flags[t->count] = (u8)flags;
+	t->seen[t->count] = 0;
 	t->count++;
 	kg_publish(t);
 	mutex_unlock(&kg_lock);
@@ -312,6 +358,7 @@ static int kg_del(u32 appid)
 			continue;
 		t->id[j] = old->id[i];
 		t->flags[j] = old->flags[i];
+		t->seen[j] = old->seen[i];
 		j++;
 	}
 
@@ -378,8 +425,9 @@ static ssize_t kg_proc_read(struct file *file, char __user *ubuf,
 	n += scnprintf(out + n, KG_OUT_MAX - n, "count %d\n", t ? t->count : 0);
 	if (t) {
 		for (i = 0; i < t->count && n < KG_OUT_MAX - 32; i++)
-			n += scnprintf(out + n, KG_OUT_MAX - n, "%u %u\n",
-				       t->id[i], t->flags[i]);
+			n += scnprintf(out + n, KG_OUT_MAX - n, "%u %u %u\n",
+				       t->id[i], t->flags[i],
+				       READ_ONCE(t->seen[i]));
 	}
 	mutex_unlock(&kg_lock);
 

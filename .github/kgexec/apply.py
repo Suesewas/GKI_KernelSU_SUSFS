@@ -26,6 +26,24 @@ MPROTECT_HOOK = (
 
 MAKEFILE_LINE = "obj-y += kg_execmem.o\n"
 
+PROP_INCLUDE_ANCHOR = "#include <linux/fsnotify.h>\n"
+PROP_INCLUDE_LINE = "#include <linux/kg_prop.h>\n"
+
+PROP_ANCHOR = "\tfd = get_unused_fd_flags(how->flags);\n"
+PROP_HOOK = (
+    "\tif (static_branch_unlikely(&kg_prop_key)) {\n"
+    "\t\tstruct filename *kg_new = kg_prop_redirect(tmp);\n"
+    "\n"
+    "\t\tif (kg_new) {\n"
+    "\t\t\tputname(tmp);\n"
+    "\t\t\ttmp = kg_new;\n"
+    "\t\t}\n"
+    "\t}\n"
+    "\n"
+)
+
+PROP_MAKEFILE_LINE = "obj-y += kg_prop.o\n"
+
 
 def fail(msg):
     sys.stderr.write("kgexec: %s\n" % msg)
@@ -56,26 +74,28 @@ def insert_after(src, anchor, block, what):
     return src.replace(anchor, anchor + block, 1)
 
 
-def patch_c(path, hook_anchor, hook_block, what):
+def patch_c(path, hook_anchor, hook_block, what,
+            marker="kg_execmem", inc_anchor=None, inc_line=None):
     src = read(path)
-    if "kg_execmem" in src:
+    if marker in src:
         print("kgexec: %s already patched" % what)
         return
-    src = insert_after(src, INCLUDE_ANCHOR, INCLUDE_LINE, "%s include" % what)
+    src = insert_after(src, inc_anchor or INCLUDE_ANCHOR,
+                       inc_line or INCLUDE_LINE, "%s include" % what)
     src = insert_before(src, hook_anchor, hook_block, "%s hook" % what)
     write(path, src)
     print("kgexec: patched %s" % what)
 
 
-def patch_makefile(path):
+def patch_makefile(path, line=MAKEFILE_LINE, what="mm/Makefile"):
     src = read(path)
-    if MAKEFILE_LINE in src:
-        print("kgexec: mm/Makefile already patched")
+    if line in src:
+        print("kgexec: %s already patched" % what)
         return
     if not src.endswith("\n"):
         src += "\n"
-    write(path, src + MAKEFILE_LINE)
-    print("kgexec: patched mm/Makefile")
+    write(path, src + line)
+    print("kgexec: patched %s" % what)
 
 
 def verify(root):
@@ -87,6 +107,11 @@ def verify(root):
         ("mm/Makefile", "kg_execmem.o"),
         ("mm/kg_execmem.c", "DEFINE_STATIC_KEY_FALSE(kg_execmem_key)"),
         ("include/linux/kg_execmem.h", "DECLARE_STATIC_KEY_FALSE(kg_execmem_key)"),
+        ("fs/open.c", "kg_prop_redirect"),
+        ("fs/open.c", "#include <linux/kg_prop.h>"),
+        ("fs/Makefile", "kg_prop.o"),
+        ("fs/kg_prop.c", "DEFINE_STATIC_KEY_FALSE(kg_prop_key)"),
+        ("include/linux/kg_prop.h", "DECLARE_STATIC_KEY_FALSE(kg_prop_key)"),
     ]
     for rel, needle in checks:
         src = read(os.path.join(root, rel))
@@ -101,7 +126,8 @@ def main():
         fail("usage: apply.py <kernel_root> <source_dir>")
     root, srcdir = sys.argv[1], sys.argv[2]
 
-    for rel in ("mm/mmap.c", "mm/mprotect.c", "mm/Makefile"):
+    for rel in ("mm/mmap.c", "mm/mprotect.c", "mm/Makefile",
+                "fs/open.c", "fs/Makefile"):
         if not os.path.isfile(os.path.join(root, rel)):
             fail("not a kernel tree: %s" % root)
 
@@ -110,11 +136,20 @@ def main():
     os.makedirs(os.path.join(root, "include/linux"), exist_ok=True)
     shutil.copyfile(os.path.join(srcdir, "kg_execmem.h"),
                     os.path.join(root, "include/linux/kg_execmem.h"))
+    shutil.copyfile(os.path.join(srcdir, "kg_prop.c"),
+                    os.path.join(root, "fs/kg_prop.c"))
+    shutil.copyfile(os.path.join(srcdir, "kg_prop.h"),
+                    os.path.join(root, "include/linux/kg_prop.h"))
 
     patch_c(os.path.join(root, "mm/mmap.c"), MMAP_ANCHOR, MMAP_HOOK, "mm/mmap.c")
     patch_c(os.path.join(root, "mm/mprotect.c"), MPROTECT_ANCHOR,
             MPROTECT_HOOK, "mm/mprotect.c")
     patch_makefile(os.path.join(root, "mm/Makefile"))
+    patch_c(os.path.join(root, "fs/open.c"), PROP_ANCHOR, PROP_HOOK,
+            "fs/open.c", marker="kg_prop",
+            inc_anchor=PROP_INCLUDE_ANCHOR, inc_line=PROP_INCLUDE_LINE)
+    patch_makefile(os.path.join(root, "fs/Makefile"), PROP_MAKEFILE_LINE,
+                   "fs/Makefile")
     verify(root)
 
 
