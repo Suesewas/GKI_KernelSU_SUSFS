@@ -44,6 +44,20 @@ PROP_HOOK = (
 
 PROP_MAKEFILE_LINE = "obj-y += kg_prop.o\n"
 
+DEX_INCLUDE_LINE = "#include <linux/kg_execmem.h>\n"
+
+DEX_ANCHOR = "\t\t\tfd_install(fd, f);\n"
+DEX_HOOK = (
+    "\t\t\tif (static_branch_unlikely(&kg_execmem_key) &&\n"
+    "\t\t\t    kg_dex_block_open(f)) {\n"
+    "\t\t\t\tput_unused_fd(fd);\n"
+    "\t\t\t\tfput(f);\n"
+    "\t\t\t\tfd = -EACCES;\n"
+    "\t\t\t} else {\n"
+    "\t\t\t\tfd_install(fd, f);\n"
+    "\t\t\t}\n"
+)
+
 
 def fail(msg):
     sys.stderr.write("kgexec: %s\n" % msg)
@@ -98,6 +112,23 @@ def patch_makefile(path, line=MAKEFILE_LINE, what="mm/Makefile"):
     print("kgexec: patched %s" % what)
 
 
+def patch_dex(path):
+    src = read(path)
+    if "kg_dex_block_open" in src:
+        print("kgexec: fs/open.c already has the dex hook")
+        return
+    if src.count(DEX_ANCHOR) != 1:
+        fail("fs/open.c: dex anchor found %d times" % src.count(DEX_ANCHOR))
+    src = src.replace(DEX_ANCHOR, DEX_HOOK, 1)
+    if DEX_INCLUDE_LINE not in src:
+        if PROP_INCLUDE_LINE not in src:
+            fail("fs/open.c: no place for the kg_execmem include")
+        src = src.replace(PROP_INCLUDE_LINE,
+                          PROP_INCLUDE_LINE + DEX_INCLUDE_LINE, 1)
+    write(path, src)
+    print("kgexec: patched fs/open.c (dex)")
+
+
 def verify(root):
     checks = [
         ("mm/mmap.c", "kg_execmem_block_mmap"),
@@ -108,6 +139,8 @@ def verify(root):
         ("mm/kg_execmem.c", "DEFINE_STATIC_KEY_FALSE(kg_execmem_key)"),
         ("include/linux/kg_execmem.h", "DECLARE_STATIC_KEY_FALSE(kg_execmem_key)"),
         ("fs/open.c", "kg_prop_redirect"),
+        ("fs/open.c", "kg_dex_block_open"),
+        ("fs/open.c", "#include <linux/kg_execmem.h>"),
         ("fs/open.c", "#include <linux/kg_prop.h>"),
         ("fs/Makefile", "kg_prop.o"),
         ("fs/kg_prop.c", "DEFINE_STATIC_KEY_FALSE(kg_prop_key)"),
@@ -150,6 +183,7 @@ def main():
             inc_anchor=PROP_INCLUDE_ANCHOR, inc_line=PROP_INCLUDE_LINE)
     patch_makefile(os.path.join(root, "fs/Makefile"), PROP_MAKEFILE_LINE,
                    "fs/Makefile")
+    patch_dex(os.path.join(root, "fs/open.c"))
     verify(root)
 
 

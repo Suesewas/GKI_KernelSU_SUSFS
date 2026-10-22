@@ -28,7 +28,7 @@
 
 #include <linux/kg_execmem.h>
 
-#define KG_ABI		4
+#define KG_ABI		5
 #define KG_MAX_APPS	512
 #define KG_SEEN_MAX	256
 #define KG_APP_MIN	10000
@@ -37,7 +37,9 @@
 #define KG_FLAG_MEM	1
 #define KG_FLAG_FILE	2
 #define KG_FLAG_WATCH	4
-#define KG_FLAG_ALL	(KG_FLAG_MEM | KG_FLAG_FILE | KG_FLAG_WATCH)
+#define KG_FLAG_DEX	8
+#define KG_FLAG_ALL	(KG_FLAG_MEM | KG_FLAG_FILE | KG_FLAG_WATCH | KG_FLAG_DEX)
+#define KG_DEX_PEEK	4096
 #define KG_CMD_MAX	64
 #define KG_OUT_MAX	16384
 
@@ -155,11 +157,22 @@ static bool kg_jit_file(struct file *file)
 	return false;
 }
 
+static bool kg_in_allow(const char *p)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(kg_allow); i++) {
+		if (strncmp(p, kg_allow[i], strlen(kg_allow[i])) == 0)
+			return true;
+	}
+
+	return false;
+}
+
 static bool kg_path_ok(struct file *file, u8 flags)
 {
 	char *buf, *p;
 	bool ok = false;
-	size_t i;
 
 	if (!(flags & KG_FLAG_MEM) && kg_jit_file(file))
 		return true;
@@ -174,12 +187,7 @@ static bool kg_path_ok(struct file *file, u8 flags)
 		return false;
 	}
 
-	for (i = 0; i < ARRAY_SIZE(kg_allow); i++) {
-		if (strncmp(p, kg_allow[i], strlen(kg_allow[i])) == 0) {
-			ok = true;
-			break;
-		}
-	}
+	ok = kg_in_allow(p);
 
 	if (!ok)
 		pr_warn_ratelimited("uid %u comm %s exec map denied: %s\n",
@@ -188,6 +196,95 @@ static bool kg_path_ok(struct file *file, u8 flags)
 
 	free_page((unsigned long)buf);
 	return ok;
+}
+
+static bool kg_buf_is_code(const char *buf, size_t n)
+{
+	size_t i;
+
+	if (n >= 4) {
+		if (memcmp(buf, "dex\n", 4) == 0)
+			return true;
+		if (memcmp(buf, "cdex", 4) == 0)
+			return true;
+		if (memcmp(buf, "vdex", 4) == 0)
+			return true;
+		if (memcmp(buf, "dey\n", 4) == 0)
+			return true;
+	}
+
+	if (n >= 4 && memcmp(buf, "PK\x03\x04", 4) != 0)
+		return false;
+
+	if (n < 30)
+		return false;
+
+	for (i = 0; i + 11 <= n; i++) {
+		if (buf[i] == 'c' && memcmp(buf + i, "classes", 7) == 0) {
+			size_t j = i + 7;
+
+			while (j < n && buf[j] >= '0' && buf[j] <= '9')
+				j++;
+			if (j + 4 <= n && memcmp(buf + j, ".dex", 4) == 0)
+				return true;
+		}
+	}
+
+	return false;
+}
+
+bool kg_dex_block_open(struct file *file)
+{
+	u32 appid = 0;
+	u8 flags;
+	char *buf, *p;
+	loff_t pos = 0;
+	ssize_t n;
+	bool bad = false;
+
+	if (!file)
+		return false;
+
+	flags = kg_flags_now(&appid);
+	if (!(flags & KG_FLAG_DEX))
+		return false;
+
+	if (!(file->f_mode & FMODE_READ))
+		return false;
+	if (!file_inode(file) || !S_ISREG(file_inode(file)->i_mode))
+		return false;
+
+	buf = (char *)__get_free_page(GFP_KERNEL);
+	if (!buf)
+		return false;
+
+	p = d_path(&file->f_path, buf, PAGE_SIZE);
+	if (IS_ERR(p) || kg_in_allow(p)) {
+		free_page((unsigned long)buf);
+		return false;
+	}
+
+	n = kernel_read(file, buf, 8, &pos);
+	if (n >= 4 && kg_buf_is_code(buf, (size_t)n)) {
+		bad = true;
+	} else if (n >= 4 && memcmp(buf, "PK\x03\x04", 4) == 0) {
+		pos = 0;
+		n = kernel_read(file, buf, KG_DEX_PEEK, &pos);
+		if (n > 0 && kg_buf_is_code(buf, (size_t)n))
+			bad = true;
+	}
+
+	if (bad) {
+		kg_mark_seen(appid);
+		p = d_path(&file->f_path, buf, PAGE_SIZE);
+		pr_warn_ratelimited("uid %u comm %s dex open denied: %s\n",
+				    from_kuid(&init_user_ns, current_uid()),
+				    current->comm, IS_ERR(p) ? "?" : p);
+	}
+
+	free_page((unsigned long)buf);
+
+	return bad;
 }
 
 bool kg_execmem_block_mmap(struct file *file, unsigned long prot)
