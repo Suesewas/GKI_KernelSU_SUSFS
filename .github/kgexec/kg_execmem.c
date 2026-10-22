@@ -58,6 +58,7 @@ static bool kg_sealed;
 static u8 kg_default;
 
 static u32 kg_seen[KG_SEEN_MAX];
+static u8 kg_seen_why[KG_SEEN_MAX];
 static atomic_t kg_seen_n = ATOMIC_INIT(0);
 
 static const char * const kg_allow[] = {
@@ -104,7 +105,7 @@ static u8 kg_flags_now(u32 *out_appid)
 	return found ? flags : READ_ONCE(kg_default);
 }
 
-static void kg_mark_seen(u32 appid)
+static void kg_mark_seen(u32 appid, u8 why)
 {
 	int n, i;
 
@@ -116,8 +117,12 @@ static void kg_mark_seen(u32 appid)
 		n = KG_SEEN_MAX;
 
 	for (i = 0; i < n; i++) {
-		if (READ_ONCE(kg_seen[i]) == appid)
+		if (READ_ONCE(kg_seen[i]) == appid) {
+			if (!(READ_ONCE(kg_seen_why[i]) & why))
+				WRITE_ONCE(kg_seen_why[i],
+					   READ_ONCE(kg_seen_why[i]) | why);
 			return;
+		}
 	}
 
 	i = atomic_fetch_inc(&kg_seen_n);
@@ -126,6 +131,7 @@ static void kg_mark_seen(u32 appid)
 		return;
 	}
 
+	WRITE_ONCE(kg_seen_why[i], why);
 	WRITE_ONCE(kg_seen[i], appid);
 }
 
@@ -275,7 +281,7 @@ bool kg_dex_block_open(struct file *file)
 	}
 
 	if (bad) {
-		kg_mark_seen(appid);
+		kg_mark_seen(appid, KG_FLAG_DEX);
 		p = d_path(&file->f_path, buf, PAGE_SIZE);
 		pr_warn_ratelimited("uid %u comm %s dex open denied: %s\n",
 				    from_kuid(&init_user_ns, current_uid()),
@@ -302,14 +308,14 @@ bool kg_execmem_block_mmap(struct file *file, unsigned long prot)
 	if (!file) {
 		if (!(flags & KG_FLAG_MEM)) {
 			if (flags & KG_FLAG_WATCH) {
-				kg_mark_seen(appid);
+				kg_mark_seen(appid, KG_FLAG_MEM);
 				pr_info_ratelimited("uid %u comm %s anonymous exec map observed\n",
 						    from_kuid(&init_user_ns, current_uid()),
 						    current->comm);
 			}
 			return false;
 		}
-		kg_mark_seen(appid);
+		kg_mark_seen(appid, KG_FLAG_MEM);
 		pr_warn_ratelimited("uid %u comm %s anonymous exec map denied\n",
 				    from_kuid(&init_user_ns, current_uid()),
 				    current->comm);
@@ -338,14 +344,14 @@ bool kg_execmem_block_mprotect(struct vm_area_struct *vma,
 	if (!vma->vm_file) {
 		if (!(flags & KG_FLAG_MEM)) {
 			if (flags & KG_FLAG_WATCH) {
-				kg_mark_seen(appid);
+				kg_mark_seen(appid, KG_FLAG_MEM);
 				pr_info_ratelimited("uid %u comm %s anonymous exec remap observed\n",
 						    from_kuid(&init_user_ns, current_uid()),
 						    current->comm);
 			}
 			return false;
 		}
-		kg_mark_seen(appid);
+		kg_mark_seen(appid, KG_FLAG_MEM);
 		pr_warn_ratelimited("uid %u comm %s anonymous exec remap denied\n",
 				    from_kuid(&init_user_ns, current_uid()),
 				    current->comm);
@@ -593,8 +599,9 @@ static ssize_t kg_proc_read(struct file *file, char __user *ubuf,
 	if (ns > KG_SEEN_MAX)
 		ns = KG_SEEN_MAX;
 	for (i = 0; i < ns && n < KG_OUT_MAX - 32; i++)
-		n += scnprintf(out + n, KG_OUT_MAX - n, "seen %u\n",
-			       READ_ONCE(kg_seen[i]));
+		n += scnprintf(out + n, KG_OUT_MAX - n, "seen %u %u\n",
+			       READ_ONCE(kg_seen[i]),
+			       READ_ONCE(kg_seen_why[i]));
 
 	ret = simple_read_from_buffer(ubuf, len, off, out, n);
 	kfree(out);
