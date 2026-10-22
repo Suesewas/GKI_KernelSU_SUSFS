@@ -28,7 +28,7 @@
 
 #include <linux/kg_execmem.h>
 
-#define KG_ABI		5
+#define KG_ABI		6
 #define KG_MAX_APPS	512
 #define KG_SEEN_MAX	256
 #define KG_APP_MIN	10000
@@ -38,7 +38,9 @@
 #define KG_FLAG_FILE	2
 #define KG_FLAG_WATCH	4
 #define KG_FLAG_DEX	8
-#define KG_FLAG_ALL	(KG_FLAG_MEM | KG_FLAG_FILE | KG_FLAG_WATCH | KG_FLAG_DEX)
+#define KG_FLAG_DEXFILE	16
+#define KG_FLAG_ALL	(KG_FLAG_MEM | KG_FLAG_FILE | KG_FLAG_WATCH | KG_FLAG_DEX | \
+			 KG_FLAG_DEXFILE)
 #define KG_DEX_PEEK	4096
 #define KG_CMD_MAX	64
 #define KG_OUT_MAX	16384
@@ -252,7 +254,7 @@ bool kg_dex_block_open(struct file *file)
 		return false;
 
 	flags = kg_flags_now(&appid);
-	if (!(flags & KG_FLAG_DEX))
+	if (!(flags & KG_FLAG_DEXFILE))
 		return false;
 
 	if (!(file->f_mode & FMODE_READ))
@@ -281,7 +283,7 @@ bool kg_dex_block_open(struct file *file)
 	}
 
 	if (bad) {
-		kg_mark_seen(appid, KG_FLAG_DEX);
+		kg_mark_seen(appid, KG_FLAG_DEXFILE);
 		p = d_path(&file->f_path, buf, PAGE_SIZE);
 		pr_warn_ratelimited("uid %u comm %s dex open denied: %s\n",
 				    from_kuid(&init_user_ns, current_uid()),
