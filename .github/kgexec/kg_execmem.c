@@ -2,6 +2,7 @@
 
 #define pr_fmt(fmt) "kg_execmem: " fmt
 
+#include <linux/atomic.h>
 #include <linux/capability.h>
 #include <linux/cred.h>
 #include <linux/dcache.h>
@@ -27,8 +28,9 @@
 
 #include <linux/kg_execmem.h>
 
-#define KG_ABI		3
+#define KG_ABI		4
 #define KG_MAX_APPS	512
+#define KG_SEEN_MAX	256
 #define KG_APP_MIN	10000
 #define KG_APP_MAX	19999
 #define KG_USER_OFF	100000
@@ -37,14 +39,13 @@
 #define KG_FLAG_WATCH	4
 #define KG_FLAG_ALL	(KG_FLAG_MEM | KG_FLAG_FILE | KG_FLAG_WATCH)
 #define KG_CMD_MAX	64
-#define KG_OUT_MAX	8192
+#define KG_OUT_MAX	16384
 
 struct kg_table {
 	struct rcu_head rcu;
 	int count;
 	u32 id[KG_MAX_APPS];
 	u8 flags[KG_MAX_APPS];
-	u8 seen[KG_MAX_APPS];
 };
 
 DEFINE_STATIC_KEY_FALSE(kg_execmem_key);
@@ -52,6 +53,10 @@ DEFINE_STATIC_KEY_FALSE(kg_execmem_key);
 static struct kg_table __rcu *kg_table;
 static DEFINE_MUTEX(kg_lock);
 static bool kg_sealed;
+static u8 kg_default;
+
+static u32 kg_seen[KG_SEEN_MAX];
+static atomic_t kg_seen_n = ATOMIC_INIT(0);
 
 static const char * const kg_allow[] = {
 	"/system/",
@@ -66,16 +71,20 @@ static const char * const kg_allow[] = {
 	"/data/dalvik-cache/",
 };
 
-static u8 kg_flags_now(void)
+static u8 kg_flags_now(u32 *out_appid)
 {
 	struct kg_table *t;
 	u32 appid;
 	u8 flags = 0;
+	bool found = false;
 	int i;
 
 	appid = from_kuid(&init_user_ns, current_uid()) % KG_USER_OFF;
 	if (appid < KG_APP_MIN || appid > KG_APP_MAX)
 		return 0;
+
+	if (out_appid)
+		*out_appid = appid;
 
 	rcu_read_lock();
 	t = rcu_dereference(kg_table);
@@ -83,35 +92,39 @@ static u8 kg_flags_now(void)
 		for (i = 0; i < t->count; i++) {
 			if (t->id[i] == appid) {
 				flags = t->flags[i];
+				found = true;
 				break;
 			}
 		}
 	}
 	rcu_read_unlock();
 
-	return flags;
+	return found ? flags : READ_ONCE(kg_default);
 }
 
-static void kg_mark_seen(void)
+static void kg_mark_seen(u32 appid)
 {
-	struct kg_table *t;
-	u32 appid;
-	int i;
+	int n, i;
 
-	appid = from_kuid(&init_user_ns, current_uid()) % KG_USER_OFF;
+	if (appid < KG_APP_MIN || appid > KG_APP_MAX)
+		return;
 
-	rcu_read_lock();
-	t = rcu_dereference(kg_table);
-	if (t) {
-		for (i = 0; i < t->count; i++) {
-			if (t->id[i] == appid) {
-				if (!READ_ONCE(t->seen[i]))
-					WRITE_ONCE(t->seen[i], 1);
-				break;
-			}
-		}
+	n = atomic_read(&kg_seen_n);
+	if (n > KG_SEEN_MAX)
+		n = KG_SEEN_MAX;
+
+	for (i = 0; i < n; i++) {
+		if (READ_ONCE(kg_seen[i]) == appid)
+			return;
 	}
-	rcu_read_unlock();
+
+	i = atomic_fetch_inc(&kg_seen_n);
+	if (i >= KG_SEEN_MAX) {
+		atomic_set(&kg_seen_n, KG_SEEN_MAX);
+		return;
+	}
+
+	WRITE_ONCE(kg_seen[i], appid);
 }
 
 static const char * const kg_jit_name[] = {
@@ -179,25 +192,27 @@ static bool kg_path_ok(struct file *file, u8 flags)
 
 bool kg_execmem_block_mmap(struct file *file, unsigned long prot)
 {
+	u32 appid = 0;
 	u8 flags;
 
 	if (!(prot & PROT_EXEC))
 		return false;
 
-	flags = kg_flags_now();
+	flags = kg_flags_now(&appid);
 	if (!flags)
 		return false;
 
 	if (!file) {
 		if (!(flags & KG_FLAG_MEM)) {
 			if (flags & KG_FLAG_WATCH) {
-				kg_mark_seen();
+				kg_mark_seen(appid);
 				pr_info_ratelimited("uid %u comm %s anonymous exec map observed\n",
 						    from_kuid(&init_user_ns, current_uid()),
 						    current->comm);
 			}
 			return false;
 		}
+		kg_mark_seen(appid);
 		pr_warn_ratelimited("uid %u comm %s anonymous exec map denied\n",
 				    from_kuid(&init_user_ns, current_uid()),
 				    current->comm);
@@ -213,25 +228,27 @@ bool kg_execmem_block_mmap(struct file *file, unsigned long prot)
 bool kg_execmem_block_mprotect(struct vm_area_struct *vma,
 			       unsigned long newflags)
 {
+	u32 appid = 0;
 	u8 flags;
 
 	if (!(newflags & VM_EXEC) || (vma->vm_flags & VM_EXEC))
 		return false;
 
-	flags = kg_flags_now();
+	flags = kg_flags_now(&appid);
 	if (!flags)
 		return false;
 
 	if (!vma->vm_file) {
 		if (!(flags & KG_FLAG_MEM)) {
 			if (flags & KG_FLAG_WATCH) {
-				kg_mark_seen();
+				kg_mark_seen(appid);
 				pr_info_ratelimited("uid %u comm %s anonymous exec remap observed\n",
 						    from_kuid(&init_user_ns, current_uid()),
 						    current->comm);
 			}
 			return false;
 		}
+		kg_mark_seen(appid);
 		pr_warn_ratelimited("uid %u comm %s anonymous exec remap denied\n",
 				    from_kuid(&init_user_ns, current_uid()),
 				    current->comm);
@@ -256,13 +273,33 @@ static struct kg_table *kg_clone(struct kg_table *old)
 		t->count = old->count;
 		memcpy(t->id, old->id, sizeof(t->id));
 		memcpy(t->flags, old->flags, sizeof(t->flags));
-		memcpy(t->seen, old->seen, sizeof(t->seen));
 	} else {
 		t->count = 0;
-		memset(t->seen, 0, sizeof(t->seen));
 	}
 
 	return t;
+}
+
+static void kg_update_key(struct kg_table *t)
+{
+	bool on;
+	int i;
+
+	on = READ_ONCE(kg_default) != 0;
+
+	if (!on && t) {
+		for (i = 0; i < t->count; i++) {
+			if (t->flags[i] != 0) {
+				on = true;
+				break;
+			}
+		}
+	}
+
+	if (on)
+		static_branch_enable(&kg_execmem_key);
+	else
+		static_branch_disable(&kg_execmem_key);
 }
 
 static void kg_publish(struct kg_table *t)
@@ -272,13 +309,31 @@ static void kg_publish(struct kg_table *t)
 	old = rcu_dereference_protected(kg_table, lockdep_is_held(&kg_lock));
 	rcu_assign_pointer(kg_table, t);
 
-	if (t && t->count > 0)
-		static_branch_enable(&kg_execmem_key);
-	else
-		static_branch_disable(&kg_execmem_key);
+	kg_update_key(t);
 
 	if (old)
 		kfree_rcu(old, rcu);
+}
+
+static int kg_set_default(u32 flags)
+{
+	struct kg_table *t;
+
+	if (flags > KG_FLAG_ALL)
+		return -EINVAL;
+
+	mutex_lock(&kg_lock);
+	if (kg_sealed) {
+		mutex_unlock(&kg_lock);
+		return -EPERM;
+	}
+
+	WRITE_ONCE(kg_default, (u8)flags);
+	t = rcu_dereference_protected(kg_table, lockdep_is_held(&kg_lock));
+	kg_update_key(t);
+	mutex_unlock(&kg_lock);
+
+	return 0;
 }
 
 static int kg_add(u32 appid, u32 flags)
@@ -288,7 +343,7 @@ static int kg_add(u32 appid, u32 flags)
 
 	if (appid < KG_APP_MIN || appid > KG_APP_MAX)
 		return -ERANGE;
-	if (flags == 0 || flags > KG_FLAG_ALL)
+	if (flags > KG_FLAG_ALL)
 		return -EINVAL;
 
 	mutex_lock(&kg_lock);
@@ -307,7 +362,6 @@ static int kg_add(u32 appid, u32 flags)
 	for (i = 0; i < t->count; i++) {
 		if (t->id[i] == appid) {
 			t->flags[i] = (u8)flags;
-			t->seen[i] = 0;
 			kg_publish(t);
 			mutex_unlock(&kg_lock);
 			return 0;
@@ -322,7 +376,6 @@ static int kg_add(u32 appid, u32 flags)
 
 	t->id[t->count] = appid;
 	t->flags[t->count] = (u8)flags;
-	t->seen[t->count] = 0;
 	t->count++;
 	kg_publish(t);
 	mutex_unlock(&kg_lock);
@@ -358,7 +411,6 @@ static int kg_del(u32 appid)
 			continue;
 		t->id[j] = old->id[i];
 		t->flags[j] = old->flags[i];
-		t->seen[j] = old->seen[i];
 		j++;
 	}
 
@@ -391,8 +443,16 @@ static int kg_clear(void)
 		return -ENOMEM;
 	}
 
+	WRITE_ONCE(kg_default, 0);
 	kg_publish(t);
 	mutex_unlock(&kg_lock);
+
+	return 0;
+}
+
+static int kg_seen_clear(void)
+{
+	atomic_set(&kg_seen_n, 0);
 
 	return 0;
 }
@@ -411,7 +471,7 @@ static ssize_t kg_proc_read(struct file *file, char __user *ubuf,
 {
 	struct kg_table *t;
 	char *out;
-	int n = 0, i;
+	int n = 0, i, ns;
 	ssize_t ret;
 
 	out = kmalloc(KG_OUT_MAX, GFP_KERNEL);
@@ -422,14 +482,22 @@ static ssize_t kg_proc_read(struct file *file, char __user *ubuf,
 	t = rcu_dereference_protected(kg_table, lockdep_is_held(&kg_lock));
 	n += scnprintf(out + n, KG_OUT_MAX - n, "abi %d\n", KG_ABI);
 	n += scnprintf(out + n, KG_OUT_MAX - n, "sealed %d\n", kg_sealed ? 1 : 0);
+	n += scnprintf(out + n, KG_OUT_MAX - n, "default %u\n",
+		       READ_ONCE(kg_default));
 	n += scnprintf(out + n, KG_OUT_MAX - n, "count %d\n", t ? t->count : 0);
 	if (t) {
 		for (i = 0; i < t->count && n < KG_OUT_MAX - 32; i++)
-			n += scnprintf(out + n, KG_OUT_MAX - n, "%u %u %u\n",
-				       t->id[i], t->flags[i],
-				       READ_ONCE(t->seen[i]));
+			n += scnprintf(out + n, KG_OUT_MAX - n, "%u %u\n",
+				       t->id[i], t->flags[i]);
 	}
 	mutex_unlock(&kg_lock);
+
+	ns = atomic_read(&kg_seen_n);
+	if (ns > KG_SEEN_MAX)
+		ns = KG_SEEN_MAX;
+	for (i = 0; i < ns && n < KG_OUT_MAX - 32; i++)
+		n += scnprintf(out + n, KG_OUT_MAX - n, "seen %u\n",
+			       READ_ONCE(kg_seen[i]));
 
 	ret = simple_read_from_buffer(ubuf, len, off, out, n);
 	kfree(out);
@@ -442,6 +510,7 @@ static ssize_t kg_proc_write(struct file *file, const char __user *ubuf,
 {
 	char cmd[KG_CMD_MAX];
 	char verb[16];
+	char arg[16];
 	unsigned int appid = 0, flags = 0;
 	int got, ret;
 
@@ -461,10 +530,16 @@ static ssize_t kg_proc_write(struct file *file, const char __user *ubuf,
 		ret = kg_add(appid, got >= 3 ? flags : KG_FLAG_MEM);
 	else if (strcmp(verb, "del") == 0 && got >= 2)
 		ret = kg_del(appid);
+	else if (strcmp(verb, "default") == 0 && got >= 2)
+		ret = kg_set_default(appid);
 	else if (strcmp(verb, "clear") == 0)
 		ret = kg_clear();
 	else if (strcmp(verb, "seal") == 0)
 		ret = kg_seal();
+	else if (strcmp(verb, "seen") == 0 &&
+		 sscanf(cmd, "%15s %15s", verb, arg) == 2 &&
+		 strcmp(arg, "clear") == 0)
+		ret = kg_seen_clear();
 	else
 		ret = -EINVAL;
 
