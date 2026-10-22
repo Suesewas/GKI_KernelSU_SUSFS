@@ -26,9 +26,36 @@
 #include <linux/uaccess.h>
 #include <linux/uidgid.h>
 
+#include <linux/elf.h>
+#include <linux/jiffies.h>
+#include <linux/mmap_lock.h>
+#include <linux/spinlock.h>
+#include <linux/uprobes.h>
+
 #include <linux/kg_execmem.h>
 
-#define KG_ABI		6
+#ifdef CONFIG_ARM64
+static inline unsigned long kg_art_arg(struct pt_regs *regs, int n)
+{
+	return regs->regs[n];
+}
+
+static inline void kg_art_set_ret(struct pt_regs *regs, unsigned long v)
+{
+	regs->regs[0] = v;
+}
+#else
+static inline unsigned long kg_art_arg(struct pt_regs *regs, int n)
+{
+	return 0;
+}
+
+static inline void kg_art_set_ret(struct pt_regs *regs, unsigned long v)
+{
+}
+#endif
+
+#define KG_ABI		7
 #define KG_MAX_APPS	512
 #define KG_SEEN_MAX	256
 #define KG_APP_MIN	10000
@@ -42,8 +69,13 @@
 #define KG_FLAG_ALL	(KG_FLAG_MEM | KG_FLAG_FILE | KG_FLAG_WATCH | KG_FLAG_DEX | \
 			 KG_FLAG_DEXFILE)
 #define KG_DEX_PEEK	4096
-#define KG_CMD_MAX	64
+#define KG_CMD_MAX	256
 #define KG_OUT_MAX	16384
+#define KG_PATH_MAX	160
+#define KG_LOC_MAX	256
+#define KG_PEND_MAX	64
+#define KG_PEND_TTL	(HZ / 2)
+#define KG_ELF_MAX	(1 << 20)
 
 struct kg_table {
 	struct rcu_head rcu;
@@ -366,6 +398,494 @@ bool kg_execmem_block_mprotect(struct vm_area_struct *vma,
 	return !kg_path_ok(vma->vm_file, flags);
 }
 
+#ifdef CONFIG_UPROBES
+
+static const char kg_art_sym_common[] =
+	"_ZN3art13DexFileLoader10OpenCommonENSt3__110shared_ptrINS_16DexFileContainerEEE"
+	"PKhmRKNS1_12basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEENS1_8optionalIjEE"
+	"PKNS_10OatDexFileEbbPSC_PNS_22DexFileLoaderErrorCodeE";
+
+static const char kg_art_sym_open[] =
+	"_ZN3art13DexFileLoader4OpenEbbbPNS_22DexFileLoaderErrorCodeE"
+	"PNSt3__112basic_stringIcNS3_11char_traitsIcEENS3_9allocatorIcEEEE"
+	"PNS3_6vectorINS3_10unique_ptrIKNS_7DexFileENS3_14default_deleteISE_EEEENS7_ISH_EEEE";
+
+static const char kg_art_anon[] = "Anonymous-DexFile@";
+
+struct kg_pend {
+	pid_t pid;
+	unsigned long when;
+};
+
+static struct kg_pend kg_pend_tab[KG_PEND_MAX];
+static DEFINE_SPINLOCK(kg_pend_lock);
+
+static struct inode *kg_art_inode;
+static loff_t kg_art_off_common;
+static loff_t kg_art_off_open;
+static bool kg_art_on;
+static char kg_art_file[KG_PATH_MAX];
+static atomic_t kg_art_hits = ATOMIC_INIT(0);
+static DEFINE_MUTEX(kg_art_lock);
+
+static void kg_pend_set(pid_t pid)
+{
+	unsigned long flags;
+	int i, free = -1;
+
+	spin_lock_irqsave(&kg_pend_lock, flags);
+	for (i = 0; i < KG_PEND_MAX; i++) {
+		if (kg_pend_tab[i].pid == pid) {
+			kg_pend_tab[i].when = jiffies;
+			spin_unlock_irqrestore(&kg_pend_lock, flags);
+			return;
+		}
+		if (free < 0 && (kg_pend_tab[i].pid == 0 ||
+				 time_after(jiffies,
+					    kg_pend_tab[i].when + KG_PEND_TTL)))
+			free = i;
+	}
+	if (free >= 0) {
+		kg_pend_tab[free].pid = pid;
+		kg_pend_tab[free].when = jiffies;
+	}
+	spin_unlock_irqrestore(&kg_pend_lock, flags);
+}
+
+static bool kg_pend_take(pid_t pid)
+{
+	unsigned long flags;
+	bool got = false;
+	int i;
+
+	spin_lock_irqsave(&kg_pend_lock, flags);
+	for (i = 0; i < KG_PEND_MAX; i++) {
+		if (kg_pend_tab[i].pid != pid)
+			continue;
+		kg_pend_tab[i].pid = 0;
+		got = !time_after(jiffies, kg_pend_tab[i].when + KG_PEND_TTL);
+		break;
+	}
+	spin_unlock_irqrestore(&kg_pend_lock, flags);
+
+	return got;
+}
+
+static void kg_pend_reset(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&kg_pend_lock, flags);
+	memset(kg_pend_tab, 0, sizeof(kg_pend_tab));
+	spin_unlock_irqrestore(&kg_pend_lock, flags);
+}
+
+static int kg_read_cxx_string(unsigned long addr, char *out, size_t max)
+{
+	u8 hdr[24];
+	u64 size, ptr;
+
+	if (!addr || max < 2)
+		return -EINVAL;
+
+	if (copy_from_user(hdr, (void __user *)addr, sizeof(hdr)))
+		return -EFAULT;
+
+	if (hdr[0] & 1) {
+		memcpy(&size, hdr + 8, sizeof(size));
+		memcpy(&ptr, hdr + 16, sizeof(ptr));
+		if (!ptr || !size)
+			return -EINVAL;
+		if (size >= (u64)max)
+			size = (u64)max - 1;
+		if (copy_from_user(out, (void __user *)(unsigned long)ptr, size))
+			return -EFAULT;
+		out[size] = '\0';
+		return 0;
+	}
+
+	size = hdr[0] >> 1;
+	if (size > 22)
+		return -EINVAL;
+	if (size >= (u64)max)
+		size = (u64)max - 1;
+	memcpy(out, hdr + 1, size);
+	out[size] = '\0';
+
+	return 0;
+}
+
+static const char *kg_basename(const char *p)
+{
+	const char *s = strrchr(p, '/');
+
+	return s ? s + 1 : p;
+}
+
+static bool kg_own_app_dir(const char *loc)
+{
+	struct vm_area_struct *vma;
+	struct mm_struct *mm = current->mm;
+	char *buf, *p;
+	size_t dir;
+	bool own = false;
+	const char *slash;
+
+	slash = strrchr(loc, '/');
+	if (!slash)
+		return false;
+	dir = slash - loc + 1;
+
+	if (!mm)
+		return false;
+
+	buf = (char *)__get_free_page(GFP_KERNEL);
+	if (!buf)
+		return false;
+
+	if (!mmap_read_trylock(mm)) {
+		free_page((unsigned long)buf);
+		return false;
+	}
+
+	{
+	VMA_ITERATOR(vmi, mm, 0);
+
+	for_each_vma(vmi, vma) {
+		if (!vma->vm_file)
+			continue;
+		p = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
+		if (IS_ERR(p))
+			continue;
+		if (strncmp(p, "/data/app/", 10) != 0)
+			continue;
+		if (strncmp(p, loc, dir) == 0) {
+			own = true;
+			break;
+		}
+	}
+	}
+
+	mmap_read_unlock(mm);
+	free_page((unsigned long)buf);
+
+	return own;
+}
+
+static bool kg_loc_denied(const char *loc, u8 *why)
+{
+	const char *base = kg_basename(loc);
+
+	if (strncmp(base, kg_art_anon, sizeof(kg_art_anon) - 1) == 0) {
+		*why = KG_FLAG_DEX;
+		return true;
+	}
+
+	if (strncmp(loc, "/data/app/", 10) == 0) {
+		if (kg_own_app_dir(loc))
+			return false;
+		*why = KG_FLAG_DEX;
+		return true;
+	}
+
+	return false;
+}
+
+static int kg_art_common_handler(struct uprobe_consumer *uc,
+				 struct pt_regs *regs)
+{
+	char loc[KG_LOC_MAX];
+	u32 appid = 0;
+	u8 flags, why = KG_FLAG_DEX;
+
+	flags = kg_flags_now(&appid);
+	if (!(flags & KG_FLAG_DEX))
+		return 0;
+
+	if (kg_read_cxx_string(kg_art_arg(regs, 3), loc, sizeof(loc)))
+		return 0;
+
+	if (!kg_loc_denied(loc, &why))
+		return 0;
+
+	kg_pend_set(current->pid);
+	kg_mark_seen(appid, why);
+	pr_warn_ratelimited("uid %u comm %s dex load denied: %s\n",
+			    from_kuid(&init_user_ns, current_uid()),
+			    current->comm, loc);
+
+	return 0;
+}
+
+static int kg_art_open_ret(struct uprobe_consumer *uc, unsigned long func,
+			   struct pt_regs *regs)
+{
+	if (!kg_pend_take(current->pid))
+		return 0;
+
+	kg_art_set_ret(regs, 0);
+	atomic_inc(&kg_art_hits);
+
+	return 0;
+}
+
+static struct uprobe_consumer kg_art_uc_common = {
+	.handler = kg_art_common_handler,
+};
+
+static struct uprobe_consumer kg_art_uc_open = {
+	.ret_handler = kg_art_open_ret,
+};
+
+static int kg_read_at(struct file *f, loff_t pos, void *buf, size_t n)
+{
+	ssize_t r = kernel_read(f, buf, n, &pos);
+
+	return (r == (ssize_t)n) ? 0 : -EIO;
+}
+
+static int kg_elf_offsets(struct file *f, loff_t *common, loff_t *open)
+{
+	struct elf64_hdr eh;
+	struct elf64_phdr *ph = NULL;
+	struct elf64_shdr *sh = NULL;
+	struct elf64_sym *sym = NULL;
+	char *str = NULL;
+	size_t phsz, shsz, symsz, strsz = 0;
+	loff_t stroff = 0;
+	int ret, i, n;
+
+	*common = 0;
+	*open = 0;
+
+	ret = kg_read_at(f, 0, &eh, sizeof(eh));
+	if (ret)
+		return ret;
+	if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0)
+		return -EINVAL;
+	if (eh.e_ident[EI_CLASS] != ELFCLASS64)
+		return -EINVAL;
+	if (!eh.e_phnum || !eh.e_shnum)
+		return -EINVAL;
+	if (eh.e_phentsize != sizeof(*ph) || eh.e_shentsize != sizeof(*sh))
+		return -EINVAL;
+	if (eh.e_phnum > 128 || eh.e_shnum > 256)
+		return -EINVAL;
+
+	phsz = (size_t)eh.e_phnum * sizeof(*ph);
+	shsz = (size_t)eh.e_shnum * sizeof(*sh);
+
+	ph = kvmalloc(phsz, GFP_KERNEL);
+	sh = kvmalloc(shsz, GFP_KERNEL);
+	if (!ph || !sh) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ret = kg_read_at(f, eh.e_phoff, ph, phsz);
+	if (ret)
+		goto out;
+	ret = kg_read_at(f, eh.e_shoff, sh, shsz);
+	if (ret)
+		goto out;
+
+	for (i = 0; i < eh.e_shnum; i++) {
+		if (sh[i].sh_type != SHT_DYNSYM)
+			continue;
+		if (sh[i].sh_entsize != sizeof(*sym))
+			continue;
+		if (sh[i].sh_link >= eh.e_shnum)
+			continue;
+		symsz = sh[i].sh_size;
+		strsz = sh[sh[i].sh_link].sh_size;
+		stroff = sh[sh[i].sh_link].sh_offset;
+		if (!symsz || !strsz || symsz > KG_ELF_MAX || strsz > KG_ELF_MAX)
+			continue;
+		sym = kvmalloc(symsz, GFP_KERNEL);
+		str = kvmalloc(strsz, GFP_KERNEL);
+		if (!sym || !str) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		ret = kg_read_at(f, sh[i].sh_offset, sym, symsz);
+		if (ret)
+			goto out;
+		ret = kg_read_at(f, stroff, str, strsz);
+		if (ret)
+			goto out;
+		break;
+	}
+
+	if (!sym || !str) {
+		ret = -ENOENT;
+		goto out;
+	}
+
+	str[strsz - 1] = '\0';
+	n = symsz / sizeof(*sym);
+
+	for (i = 0; i < n; i++) {
+		const char *name;
+		loff_t off = -1;
+		int j;
+
+		if (!sym[i].st_name || sym[i].st_name >= strsz || !sym[i].st_value)
+			continue;
+		name = str + sym[i].st_name;
+
+		if (strcmp(name, kg_art_sym_common) != 0 &&
+		    strcmp(name, kg_art_sym_open) != 0)
+			continue;
+
+		for (j = 0; j < eh.e_phnum; j++) {
+			u64 va = ph[j].p_vaddr;
+
+			if (ph[j].p_type != PT_LOAD)
+				continue;
+			if (sym[i].st_value < va ||
+			    sym[i].st_value >= va + ph[j].p_filesz)
+				continue;
+			off = ph[j].p_offset + (sym[i].st_value - va);
+			break;
+		}
+
+		if (off < 0)
+			continue;
+
+		if (strcmp(name, kg_art_sym_common) == 0)
+			*common = off;
+		else
+			*open = off;
+	}
+
+	ret = (*common && *open) ? 0 : -ENOENT;
+
+out:
+	kvfree(ph);
+	kvfree(sh);
+	kvfree(sym);
+	kvfree(str);
+
+	return ret;
+}
+
+static void kg_art_off(void)
+{
+	if (!kg_art_on)
+		return;
+
+	uprobe_unregister(kg_art_inode, kg_art_off_common, &kg_art_uc_common);
+	uprobe_unregister(kg_art_inode, kg_art_off_open, &kg_art_uc_open);
+	iput(kg_art_inode);
+	kg_art_inode = NULL;
+	kg_art_off_common = 0;
+	kg_art_off_open = 0;
+	kg_art_file[0] = '\0';
+	kg_art_on = false;
+	kg_pend_reset();
+	pr_warn("art hooks removed\n");
+}
+
+static int kg_art_arm(const char *path)
+{
+	struct file *f;
+	struct inode *inode;
+	loff_t common = 0, open = 0;
+	int ret;
+
+	if (!path[0] || path[0] != '/')
+		return -EINVAL;
+
+	f = filp_open(path, O_RDONLY, 0);
+	if (IS_ERR(f))
+		return PTR_ERR(f);
+
+	ret = kg_elf_offsets(f, &common, &open);
+	if (ret) {
+		filp_close(f, NULL);
+		return ret;
+	}
+
+	inode = igrab(file_inode(f));
+	filp_close(f, NULL);
+	if (!inode)
+		return -ENOENT;
+
+	kg_art_off();
+
+	ret = uprobe_register(inode, common, &kg_art_uc_common);
+	if (ret) {
+		iput(inode);
+		return ret;
+	}
+
+	ret = uprobe_register(inode, open, &kg_art_uc_open);
+	if (ret) {
+		uprobe_unregister(inode, common, &kg_art_uc_common);
+		iput(inode);
+		return ret;
+	}
+
+	kg_art_inode = inode;
+	kg_art_off_common = common;
+	kg_art_off_open = open;
+	strscpy(kg_art_file, path, sizeof(kg_art_file));
+	kg_art_on = true;
+	atomic_set(&kg_art_hits, 0);
+
+	pr_warn("art hooks armed on %s common=%#llx open=%#llx\n",
+		path, (unsigned long long)common, (unsigned long long)open);
+
+	return 0;
+}
+
+static int kg_art_cmd(const char *arg)
+{
+	int ret;
+
+	mutex_lock(&kg_art_lock);
+	if (kg_sealed) {
+		mutex_unlock(&kg_art_lock);
+		return -EPERM;
+	}
+	if (strcmp(arg, "off") == 0) {
+		kg_art_off();
+		ret = 0;
+	} else {
+		ret = kg_art_arm(arg);
+	}
+	mutex_unlock(&kg_art_lock);
+
+	return ret;
+}
+
+static int kg_art_report(char *out, size_t max)
+{
+	int n;
+
+	mutex_lock(&kg_art_lock);
+	n = scnprintf(out, max, "art %d %d %s\n", kg_art_on ? 1 : 0,
+		      atomic_read(&kg_art_hits),
+		      kg_art_on ? kg_art_file : "-");
+	mutex_unlock(&kg_art_lock);
+
+	return n;
+}
+
+#else /* CONFIG_UPROBES */
+
+static int kg_art_cmd(const char *arg)
+{
+	return -ENOTSUPP;
+}
+
+static int kg_art_report(char *out, size_t max)
+{
+	return scnprintf(out, max, "art 0 0 -\n");
+}
+
+#endif /* CONFIG_UPROBES */
+
 static struct kg_table *kg_clone(struct kg_table *old)
 {
 	struct kg_table *t;
@@ -590,6 +1110,7 @@ static ssize_t kg_proc_read(struct file *file, char __user *ubuf,
 	n += scnprintf(out + n, KG_OUT_MAX - n, "default %u\n",
 		       READ_ONCE(kg_default));
 	n += scnprintf(out + n, KG_OUT_MAX - n, "count %d\n", t ? t->count : 0);
+	n += kg_art_report(out + n, KG_OUT_MAX - n);
 	if (t) {
 		for (i = 0; i < t->count && n < KG_OUT_MAX - 32; i++)
 			n += scnprintf(out + n, KG_OUT_MAX - n, "%u %u\n",
@@ -616,7 +1137,7 @@ static ssize_t kg_proc_write(struct file *file, const char __user *ubuf,
 {
 	char cmd[KG_CMD_MAX];
 	char verb[16];
-	char arg[16];
+	char arg[KG_PATH_MAX];
 	unsigned int appid = 0, flags = 0;
 	int got, ret;
 
@@ -642,8 +1163,11 @@ static ssize_t kg_proc_write(struct file *file, const char __user *ubuf,
 		ret = kg_clear();
 	else if (strcmp(verb, "seal") == 0)
 		ret = kg_seal();
+	else if (strcmp(verb, "art") == 0 &&
+		 sscanf(cmd, "%15s %159s", verb, arg) == 2)
+		ret = kg_art_cmd(arg);
 	else if (strcmp(verb, "seen") == 0 &&
-		 sscanf(cmd, "%15s %15s", verb, arg) == 2 &&
+		 sscanf(cmd, "%15s %159s", verb, arg) == 2 &&
 		 strcmp(arg, "clear") == 0)
 		ret = kg_seen_clear();
 	else
