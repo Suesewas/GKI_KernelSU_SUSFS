@@ -540,7 +540,10 @@ static int kg_art_common_handler(struct uprobe_consumer *uc,
 	if (!kg_loc_denied(loc, &why))
 		return 0;
 
-	kg_art_set_arg(regs, 1, kg_art_arg(regs, 1) + kg_art_arg(regs, 2));
+	if (!kg_art_arg(regs, 2))
+		return 0;
+
+	kg_art_set_arg(regs, 1, kg_art_arg(regs, 1) + 1);
 	atomic_inc(&kg_art_hits);
 	kg_mark_seen(appid, why);
 	pr_warn_ratelimited("uid %u comm %s dex load denied: %s\n",
