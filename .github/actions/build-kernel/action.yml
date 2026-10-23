@@ -13,9 +13,12 @@ runs:
     uses: ./.github/actions/set-kernel-config
   
   - name: 'Build Kernel'
+    id: kbuild
     shell: bash
     working-directory: ${{ github.workspace }}/kernel
     run: |
+      set -o pipefail
+      exec > >(tee /home/runner/kbuild.log) 2>&1
       sed -i 's/check_defconfig//' ./common/build.config.gki
       if [ -f "build/build.sh" ]; then
         BUILD_GKI_ARTIFACTS="" \
@@ -39,6 +42,19 @@ runs:
           --disk_cache=/home/runner/.cache/bazel \
           //common:kernel_aarch64/Image
       fi
+
+  - name: 'Report Build Failure'
+    if: failure()
+    shell: bash
+    run: |
+      log=/home/runner/kbuild.log
+      [ -f "$log" ] || { echo "::error::нет $log"; exit 0; }
+      msg=$(grep -iE "error|undefined|No such file|fatal" "$log" | tail -25)
+      [ -n "$msg" ] || msg=$(tail -30 "$log")
+      msg=${msg//'%'/'%25'}
+      msg=${msg//$'\n'/'%0A'}
+      msg=${msg//$'\r'/''}
+      echo "::error title=kbuild::${msg}"
 
   - name: 'Gather Build Artifacts'
     shell: bash
