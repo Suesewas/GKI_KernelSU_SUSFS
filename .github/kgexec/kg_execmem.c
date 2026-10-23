@@ -66,6 +66,7 @@ static inline void kg_art_set_arg(struct pt_regs *regs, int n, unsigned long v)
 #define KG_FLAG_WATCH	4
 #define KG_FLAG_DEX	8
 #define KG_FLAG_DEXFILE	16
+#define KG_SEEN_MEM	32
 #define KG_FLAG_ALL	(KG_FLAG_MEM | KG_FLAG_FILE | KG_FLAG_WATCH | KG_FLAG_DEX | \
 			 KG_FLAG_DEXFILE)
 #define KG_DEX_PEEK	4096
@@ -509,7 +510,7 @@ static bool kg_loc_denied(const char *loc, u8 *why)
 	const char *base = kg_basename(loc);
 
 	if (strncmp(base, kg_art_anon, sizeof(kg_art_anon) - 1) == 0) {
-		*why = KG_FLAG_DEX;
+		*why = KG_SEEN_MEM;
 		return true;
 	}
 
