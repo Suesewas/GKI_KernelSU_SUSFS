@@ -32,6 +32,8 @@
 #include <linux/spinlock.h>
 #include <linux/uprobes.h>
 
+#include <asm/compat.h>
+
 #include <linux/kg_execmem.h>
 
 #ifdef CONFIG_ARM64
@@ -67,6 +69,7 @@ static inline void kg_art_set_arg(struct pt_regs *regs, int n, unsigned long v)
 #define KG_FLAG_DEX	8
 #define KG_FLAG_DEXFILE	16
 #define KG_SEEN_MEM	32
+#define KG_NAME_MAX	128
 #define KG_FLAG_ALL	(KG_FLAG_MEM | KG_FLAG_FILE | KG_FLAG_WATCH | KG_FLAG_DEX | \
 			 KG_FLAG_DEXFILE)
 #define KG_DEX_PEEK	4096
@@ -399,10 +402,8 @@ bool kg_execmem_block_mprotect(struct vm_area_struct *vma,
 
 #ifdef CONFIG_UPROBES
 
-static const char kg_art_sym_common[] =
-	"_ZN3art13DexFileLoader10OpenCommonENSt3__110shared_ptrINS_16DexFileContainerEEE"
-	"PKhmRKNS1_12basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEENS1_8optionalIjEE"
-	"PKNS_10OatDexFileEbbPSC_PNS_22DexFileLoaderErrorCodeE";
+static const char kg_art_sym_pre[] = "_ZN3art13DexFileLoader10OpenCommonE";
+static const char kg_art_sym_want[] = "shared_ptrINS_16DexFileContainerEEE";
 
 static const char kg_art_anon[] = "Anonymous-DexFile@";
 
@@ -455,54 +456,69 @@ static const char *kg_basename(const char *p)
 	return s ? s + 1 : p;
 }
 
-static bool kg_own_app_dir(const char *loc)
+static int kg_self_name(char *out, size_t max)
 {
-	struct vm_area_struct *vma;
 	struct mm_struct *mm = current->mm;
-	char *buf, *p;
-	size_t dir;
-	bool own = false;
-	const char *slash;
+	unsigned long start, len;
+	size_t i;
 
-	slash = strrchr(loc, '/');
-	if (!slash)
-		return false;
-	dir = slash - loc + 1;
+	if (!mm || max < 2)
+		return -EINVAL;
 
-	if (!mm)
-		return false;
+	start = READ_ONCE(mm->arg_start);
+	len = READ_ONCE(mm->arg_end) - start;
+	if (!start || (long)len <= 0)
+		return -EINVAL;
+	if (len >= max)
+		len = max - 1;
 
-	buf = (char *)__get_free_page(GFP_KERNEL);
-	if (!buf)
-		return false;
+	if (copy_from_user(out, (void __user *)start, len))
+		return -EFAULT;
+	out[len] = '\0';
 
-	if (!mmap_read_trylock(mm)) {
-		free_page((unsigned long)buf);
-		return false;
-	}
-
-	{
-	VMA_ITERATOR(vmi, mm, 0);
-
-	for_each_vma(vmi, vma) {
-		if (!vma->vm_file)
-			continue;
-		p = d_path(&vma->vm_file->f_path, buf, PAGE_SIZE);
-		if (IS_ERR(p))
-			continue;
-		if (strncmp(p, "/data/app/", 10) != 0)
-			continue;
-		if (strncmp(p, loc, dir) == 0) {
-			own = true;
+	for (i = 0; i < len; i++) {
+		if (out[i] == '\0')
+			break;
+		if (out[i] == ':') {
+			out[i] = '\0';
 			break;
 		}
 	}
+	out[len] = '\0';
+
+	return out[0] ? 0 : -EINVAL;
+}
+
+static bool kg_own_app_dir(const char *loc)
+{
+	char me[KG_NAME_MAX];
+	const char *p = loc + 10;
+	const char *slash, *dash;
+	size_t n;
+
+	if (kg_self_name(me, sizeof(me)))
+		return true;
+
+	while (*p == '~') {
+		slash = strchr(p, '/');
+		if (!slash)
+			return false;
+		p = slash + 1;
 	}
 
-	mmap_read_unlock(mm);
-	free_page((unsigned long)buf);
+	slash = strchr(p, '/');
+	if (!slash)
+		return false;
 
-	return own;
+	dash = p;
+	while (dash < slash && *dash != '-')
+		dash++;
+
+	n = dash - p;
+	if (!n || n >= sizeof(me))
+		return false;
+
+	return strlen(me) == n && strncmp(p, me, n) == 0;
 }
 
 static bool kg_loc_denied(const char *loc, u8 *why)
@@ -530,6 +546,9 @@ static int kg_art_common_handler(struct uprobe_consumer *uc,
 	char loc[KG_LOC_MAX];
 	u32 appid = 0;
 	u8 flags, why = KG_FLAG_DEX;
+
+	if (is_compat_task())
+		return 0;
 
 	flags = kg_flags_now(&appid);
 	if (!(flags & KG_FLAG_DEX))
@@ -653,8 +672,13 @@ static int kg_elf_offsets(struct file *f, loff_t *common)
 			continue;
 		name = str + sym[i].st_name;
 
-		if (strcmp(name, kg_art_sym_common) != 0)
+		if (strncmp(name, kg_art_sym_pre, sizeof(kg_art_sym_pre) - 1) != 0)
 			continue;
+		if (!strstr(name, kg_art_sym_want)) {
+			if (!*common)
+				*common = 0;
+			continue;
+		}
 
 		for (j = 0; j < eh.e_phnum; j++) {
 			u64 va = ph[j].p_vaddr;
