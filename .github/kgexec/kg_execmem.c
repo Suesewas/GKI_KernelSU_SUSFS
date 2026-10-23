@@ -405,11 +405,6 @@ static const char kg_art_sym_common[] =
 	"PKhmRKNS1_12basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEENS1_8optionalIjEE"
 	"PKNS_10OatDexFileEbbPSC_PNS_22DexFileLoaderErrorCodeE";
 
-static const char kg_art_sym_open[] =
-	"_ZN3art13DexFileLoader4OpenEbbbPNS_22DexFileLoaderErrorCodeE"
-	"PNSt3__112basic_stringIcNS3_11char_traitsIcEENS3_9allocatorIcEEEE"
-	"PNS3_6vectorINS3_10unique_ptrIKNS_7DexFileENS3_14default_deleteISE_EEEENS7_ISH_EEEE";
-
 static const char kg_art_anon[] = "Anonymous-DexFile@";
 
 struct kg_pend {
@@ -422,7 +417,6 @@ static DEFINE_SPINLOCK(kg_pend_lock);
 
 static struct inode *kg_art_inode;
 static loff_t kg_art_off_common;
-static loff_t kg_art_off_open;
 static bool kg_art_on;
 static char kg_art_file[KG_PATH_MAX];
 static atomic_t kg_art_hits = ATOMIC_INIT(0);
@@ -617,8 +611,8 @@ static int kg_art_common_handler(struct uprobe_consumer *uc,
 	return 0;
 }
 
-static int kg_art_open_ret(struct uprobe_consumer *uc, unsigned long func,
-			   struct pt_regs *regs)
+static int kg_art_common_ret(struct uprobe_consumer *uc, unsigned long func,
+			     struct pt_regs *regs)
 {
 	if (!kg_pend_take(current->pid))
 		return 0;
@@ -631,10 +625,7 @@ static int kg_art_open_ret(struct uprobe_consumer *uc, unsigned long func,
 
 static struct uprobe_consumer kg_art_uc_common = {
 	.handler = kg_art_common_handler,
-};
-
-static struct uprobe_consumer kg_art_uc_open = {
-	.ret_handler = kg_art_open_ret,
+	.ret_handler = kg_art_common_ret,
 };
 
 static int kg_read_at(struct file *f, loff_t pos, void *buf, size_t n)
@@ -644,7 +635,7 @@ static int kg_read_at(struct file *f, loff_t pos, void *buf, size_t n)
 	return (r == (ssize_t)n) ? 0 : -EIO;
 }
 
-static int kg_elf_offsets(struct file *f, loff_t *common, loff_t *open)
+static int kg_elf_offsets(struct file *f, loff_t *common)
 {
 	struct elf64_hdr eh;
 	struct elf64_phdr *ph = NULL;
@@ -656,7 +647,6 @@ static int kg_elf_offsets(struct file *f, loff_t *common, loff_t *open)
 	int ret, i, n;
 
 	*common = 0;
-	*open = 0;
 
 	ret = kg_read_at(f, 0, &eh, sizeof(eh));
 	if (ret)
@@ -733,8 +723,7 @@ static int kg_elf_offsets(struct file *f, loff_t *common, loff_t *open)
 			continue;
 		name = str + sym[i].st_name;
 
-		if (strcmp(name, kg_art_sym_common) != 0 &&
-		    strcmp(name, kg_art_sym_open) != 0)
+		if (strcmp(name, kg_art_sym_common) != 0)
 			continue;
 
 		for (j = 0; j < eh.e_phnum; j++) {
@@ -752,13 +741,11 @@ static int kg_elf_offsets(struct file *f, loff_t *common, loff_t *open)
 		if (off < 0)
 			continue;
 
-		if (strcmp(name, kg_art_sym_common) == 0)
-			*common = off;
-		else
-			*open = off;
+		*common = off;
+		break;
 	}
 
-	ret = (*common && *open) ? 0 : -ENOENT;
+	ret = *common ? 0 : -ENOENT;
 
 out:
 	kvfree(ph);
@@ -775,11 +762,9 @@ static void kg_art_off(void)
 		return;
 
 	uprobe_unregister(kg_art_inode, kg_art_off_common, &kg_art_uc_common);
-	uprobe_unregister(kg_art_inode, kg_art_off_open, &kg_art_uc_open);
 	iput(kg_art_inode);
 	kg_art_inode = NULL;
 	kg_art_off_common = 0;
-	kg_art_off_open = 0;
 	kg_art_file[0] = '\0';
 	kg_art_on = false;
 	kg_pend_reset();
@@ -790,7 +775,7 @@ static int kg_art_arm(const char *path)
 {
 	struct file *f;
 	struct inode *inode;
-	loff_t common = 0, open = 0;
+	loff_t common = 0;
 	int ret;
 
 	if (!path[0] || path[0] != '/')
@@ -800,7 +785,7 @@ static int kg_art_arm(const char *path)
 	if (IS_ERR(f))
 		return PTR_ERR(f);
 
-	ret = kg_elf_offsets(f, &common, &open);
+	ret = kg_elf_offsets(f, &common);
 	if (ret) {
 		filp_close(f, NULL);
 		return ret;
@@ -819,22 +804,14 @@ static int kg_art_arm(const char *path)
 		return ret;
 	}
 
-	ret = uprobe_register(inode, open, &kg_art_uc_open);
-	if (ret) {
-		uprobe_unregister(inode, common, &kg_art_uc_common);
-		iput(inode);
-		return ret;
-	}
-
 	kg_art_inode = inode;
 	kg_art_off_common = common;
-	kg_art_off_open = open;
 	strscpy(kg_art_file, path, sizeof(kg_art_file));
 	kg_art_on = true;
 	atomic_set(&kg_art_hits, 0);
 
-	pr_warn("art hooks armed on %s common=%#llx open=%#llx\n",
-		path, (unsigned long long)common, (unsigned long long)open);
+	pr_warn("art hook armed on %s common=%#llx\n",
+		path, (unsigned long long)common);
 
 	return 0;
 }
@@ -1075,6 +1052,28 @@ static int kg_clear(void)
 	return 0;
 }
 
+static int kg_seen_del(u32 appid)
+{
+	int n, i;
+
+	if (appid < KG_APP_MIN || appid > KG_APP_MAX)
+		return -ERANGE;
+
+	n = atomic_read(&kg_seen_n);
+	if (n > KG_SEEN_MAX)
+		n = KG_SEEN_MAX;
+
+	for (i = 0; i < n; i++) {
+		if (READ_ONCE(kg_seen[i]) != appid)
+			continue;
+		WRITE_ONCE(kg_seen_why[i], 0);
+		WRITE_ONCE(kg_seen[i], 0);
+		return 0;
+	}
+
+	return 0;
+}
+
 static int kg_seen_clear(void)
 {
 	atomic_set(&kg_seen_n, 0);
@@ -1167,9 +1166,15 @@ static ssize_t kg_proc_write(struct file *file, const char __user *ubuf,
 		 sscanf(cmd, "%15s %159s", verb, arg) == 2)
 		ret = kg_art_cmd(arg);
 	else if (strcmp(verb, "seen") == 0 &&
-		 sscanf(cmd, "%15s %159s", verb, arg) == 2 &&
-		 strcmp(arg, "clear") == 0)
-		ret = kg_seen_clear();
+		 sscanf(cmd, "%15s %159s %u", verb, arg, &appid) >= 2) {
+		if (strcmp(arg, "clear") == 0)
+			ret = kg_seen_clear();
+		else if (strcmp(arg, "del") == 0 &&
+			 sscanf(cmd, "%15s %159s %u", verb, arg, &appid) == 3)
+			ret = kg_seen_del(appid);
+		else
+			ret = -EINVAL;
+	}
 	else
 		ret = -EINVAL;
 
