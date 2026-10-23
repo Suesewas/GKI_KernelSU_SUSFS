@@ -40,9 +40,9 @@ static inline unsigned long kg_art_arg(struct pt_regs *regs, int n)
 	return regs->regs[n];
 }
 
-static inline void kg_art_set_ret(struct pt_regs *regs, unsigned long v)
+static inline void kg_art_set_arg(struct pt_regs *regs, int n, unsigned long v)
 {
-	regs->regs[0] = v;
+	regs->regs[n] = v;
 }
 #else
 static inline unsigned long kg_art_arg(struct pt_regs *regs, int n)
@@ -50,7 +50,7 @@ static inline unsigned long kg_art_arg(struct pt_regs *regs, int n)
 	return 0;
 }
 
-static inline void kg_art_set_ret(struct pt_regs *regs, unsigned long v)
+static inline void kg_art_set_arg(struct pt_regs *regs, int n, unsigned long v)
 {
 }
 #endif
@@ -73,8 +73,6 @@ static inline void kg_art_set_ret(struct pt_regs *regs, unsigned long v)
 #define KG_OUT_MAX	16384
 #define KG_PATH_MAX	160
 #define KG_LOC_MAX	256
-#define KG_PEND_MAX	64
-#define KG_PEND_TTL	(HZ / 2)
 #define KG_ELF_MAX	(1 << 20)
 
 struct kg_table {
@@ -407,72 +405,12 @@ static const char kg_art_sym_common[] =
 
 static const char kg_art_anon[] = "Anonymous-DexFile@";
 
-struct kg_pend {
-	pid_t pid;
-	unsigned long when;
-};
-
-static struct kg_pend kg_pend_tab[KG_PEND_MAX];
-static DEFINE_SPINLOCK(kg_pend_lock);
-
 static struct inode *kg_art_inode;
 static loff_t kg_art_off_common;
 static bool kg_art_on;
 static char kg_art_file[KG_PATH_MAX];
 static atomic_t kg_art_hits = ATOMIC_INIT(0);
 static DEFINE_MUTEX(kg_art_lock);
-
-static void kg_pend_set(pid_t pid)
-{
-	unsigned long flags;
-	int i, free = -1;
-
-	spin_lock_irqsave(&kg_pend_lock, flags);
-	for (i = 0; i < KG_PEND_MAX; i++) {
-		if (kg_pend_tab[i].pid == pid) {
-			kg_pend_tab[i].when = jiffies;
-			spin_unlock_irqrestore(&kg_pend_lock, flags);
-			return;
-		}
-		if (free < 0 && (kg_pend_tab[i].pid == 0 ||
-				 time_after(jiffies,
-					    kg_pend_tab[i].when + KG_PEND_TTL)))
-			free = i;
-	}
-	if (free >= 0) {
-		kg_pend_tab[free].pid = pid;
-		kg_pend_tab[free].when = jiffies;
-	}
-	spin_unlock_irqrestore(&kg_pend_lock, flags);
-}
-
-static bool kg_pend_take(pid_t pid)
-{
-	unsigned long flags;
-	bool got = false;
-	int i;
-
-	spin_lock_irqsave(&kg_pend_lock, flags);
-	for (i = 0; i < KG_PEND_MAX; i++) {
-		if (kg_pend_tab[i].pid != pid)
-			continue;
-		kg_pend_tab[i].pid = 0;
-		got = !time_after(jiffies, kg_pend_tab[i].when + KG_PEND_TTL);
-		break;
-	}
-	spin_unlock_irqrestore(&kg_pend_lock, flags);
-
-	return got;
-}
-
-static void kg_pend_reset(void)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&kg_pend_lock, flags);
-	memset(kg_pend_tab, 0, sizeof(kg_pend_tab));
-	spin_unlock_irqrestore(&kg_pend_lock, flags);
-}
 
 static int kg_read_cxx_string(unsigned long addr, char *out, size_t max)
 {
@@ -602,7 +540,8 @@ static int kg_art_common_handler(struct uprobe_consumer *uc,
 	if (!kg_loc_denied(loc, &why))
 		return 0;
 
-	kg_pend_set(current->pid);
+	kg_art_set_arg(regs, 1, 0);
+	atomic_inc(&kg_art_hits);
 	kg_mark_seen(appid, why);
 	pr_warn_ratelimited("uid %u comm %s dex load denied: %s\n",
 			    from_kuid(&init_user_ns, current_uid()),
@@ -611,21 +550,8 @@ static int kg_art_common_handler(struct uprobe_consumer *uc,
 	return 0;
 }
 
-static int kg_art_common_ret(struct uprobe_consumer *uc, unsigned long func,
-			     struct pt_regs *regs)
-{
-	if (!kg_pend_take(current->pid))
-		return 0;
-
-	kg_art_set_ret(regs, 0);
-	atomic_inc(&kg_art_hits);
-
-	return 0;
-}
-
 static struct uprobe_consumer kg_art_uc_common = {
 	.handler = kg_art_common_handler,
-	.ret_handler = kg_art_common_ret,
 };
 
 static int kg_read_at(struct file *f, loff_t pos, void *buf, size_t n)
@@ -767,7 +693,6 @@ static void kg_art_off(void)
 	kg_art_off_common = 0;
 	kg_art_file[0] = '\0';
 	kg_art_on = false;
-	kg_pend_reset();
 	pr_warn("art hooks removed\n");
 }
 
