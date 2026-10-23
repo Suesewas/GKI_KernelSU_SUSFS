@@ -59,6 +59,41 @@ DEX_HOOK = (
 )
 
 
+CRED_MAKEFILE_LINE = "obj-y += kg_cred.o\n"
+
+CRED_COMMIT_ANCHOR = "\ttrace_android_rvh_commit_creds(task, new);\n"
+CRED_COMMIT_HOOK = (
+    "\tif (static_branch_unlikely(&kg_cred_key))\n"
+    "\t\tkg_cred_commit(task, new);\n"
+)
+
+CRED_FORK_ANCHOR = "\ttrace_task_newtask(p, clone_flags);\n"
+CRED_FORK_HOOK = (
+    "\tif (static_branch_unlikely(&kg_cred_key))\n"
+    "\t\tkg_cred_fork(p);\n"
+)
+
+CRED_EXIT_ANCHOR = "\tprofile_task_exit(tsk);\n"
+CRED_EXIT_HOOK = (
+    "\tif (static_branch_unlikely(&kg_cred_key))\n"
+    "\t\tkg_cred_exit(tsk);\n"
+)
+
+CRED_EXEC_ANCHOR = "\tcheck_unsafe_exec(bprm);\n"
+CRED_EXEC_HOOK = (
+    "\tif (static_branch_unlikely(&kg_cred_key))\n"
+    "\t\tkg_cred_check();\n"
+)
+
+CRED_OPEN_HOOK = (
+    "\tif (static_branch_unlikely(&kg_cred_key))\n"
+    "\t\tkg_cred_check();\n"
+    "\n"
+)
+
+CRED_INCLUDE_LINE = "#include <linux/kg_cred.h>\n"
+
+
 def fail(msg):
     sys.stderr.write("kgexec: %s\n" % msg)
     sys.exit(1)
@@ -129,6 +164,44 @@ def patch_dex(path):
     print("kgexec: patched fs/open.c (dex)")
 
 
+def patch_cred(root):
+    jobs = [
+        ("kernel/cred.c", CRED_COMMIT_ANCHOR, CRED_COMMIT_HOOK, "kg_cred_commit",
+         "#include <linux/security.h>\n"),
+        ("kernel/fork.c", CRED_FORK_ANCHOR, CRED_FORK_HOOK, "kg_cred_fork",
+         "#include <linux/sched/task.h>\n"),
+        ("kernel/exit.c", CRED_EXIT_ANCHOR, CRED_EXIT_HOOK, "kg_cred_exit",
+         "#include <linux/profile.h>\n"),
+        ("fs/exec.c", CRED_EXEC_ANCHOR, CRED_EXEC_HOOK, "kg_cred_check",
+         "#include <linux/security.h>\n"),
+    ]
+    for rel, anchor, hook, marker, inc_anchor in jobs:
+        path = os.path.join(root, rel)
+        src = read(path)
+        if marker in src:
+            print("kgexec: %s already patched" % rel)
+            continue
+        if CRED_INCLUDE_LINE not in src:
+            src = insert_after(src, inc_anchor, CRED_INCLUDE_LINE,
+                               "%s include" % rel)
+        src = insert_before(src, anchor, hook, "%s hook" % rel)
+        write(path, src)
+        print("kgexec: patched %s" % rel)
+
+    path = os.path.join(root, "fs/open.c")
+    src = read(path)
+    if "kg_cred_check" not in src:
+        if CRED_INCLUDE_LINE not in src:
+            src = insert_after(src, PROP_INCLUDE_LINE, CRED_INCLUDE_LINE,
+                               "fs/open.c cred include")
+        src = insert_before(src, PROP_ANCHOR, CRED_OPEN_HOOK,
+                            "fs/open.c cred hook")
+        write(path, src)
+        print("kgexec: patched fs/open.c (cred)")
+    else:
+        print("kgexec: fs/open.c already has the cred hook")
+
+
 def verify(root):
     checks = [
         ("mm/mmap.c", "kg_execmem_block_mmap"),
@@ -145,6 +218,14 @@ def verify(root):
         ("fs/Makefile", "kg_prop.o"),
         ("fs/kg_prop.c", "DEFINE_STATIC_KEY_FALSE(kg_prop_key)"),
         ("include/linux/kg_prop.h", "DECLARE_STATIC_KEY_FALSE(kg_prop_key)"),
+        ("kernel/kg_cred.c", "DEFINE_STATIC_KEY_FALSE(kg_cred_key)"),
+        ("include/linux/kg_cred.h", "DECLARE_STATIC_KEY_FALSE(kg_cred_key)"),
+        ("kernel/Makefile", "kg_cred.o"),
+        ("kernel/cred.c", "kg_cred_commit(task, new)"),
+        ("kernel/fork.c", "kg_cred_fork(p)"),
+        ("kernel/exit.c", "kg_cred_exit(tsk)"),
+        ("fs/exec.c", "kg_cred_check()"),
+        ("fs/open.c", "kg_cred_check()"),
     ]
     for rel, needle in checks:
         src = read(os.path.join(root, rel))
@@ -160,7 +241,8 @@ def main():
     root, srcdir = sys.argv[1], sys.argv[2]
 
     for rel in ("mm/mmap.c", "mm/mprotect.c", "mm/Makefile",
-                "fs/open.c", "fs/Makefile"):
+                "fs/open.c", "fs/Makefile", "kernel/cred.c", "kernel/fork.c",
+                "kernel/exit.c", "fs/exec.c", "kernel/Makefile"):
         if not os.path.isfile(os.path.join(root, rel)):
             fail("not a kernel tree: %s" % root)
 
@@ -184,6 +266,15 @@ def main():
     patch_makefile(os.path.join(root, "fs/Makefile"), PROP_MAKEFILE_LINE,
                    "fs/Makefile")
     patch_dex(os.path.join(root, "fs/open.c"))
+
+    shutil.copyfile(os.path.join(srcdir, "kg_cred.c"),
+                    os.path.join(root, "kernel/kg_cred.c"))
+    shutil.copyfile(os.path.join(srcdir, "kg_cred.h"),
+                    os.path.join(root, "include/linux/kg_cred.h"))
+    patch_makefile(os.path.join(root, "kernel/Makefile"), CRED_MAKEFILE_LINE,
+                   "kernel/Makefile")
+    patch_cred(root)
+
     verify(root)
 
 

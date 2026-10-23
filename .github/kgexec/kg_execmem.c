@@ -57,7 +57,7 @@ static inline void kg_art_set_arg(struct pt_regs *regs, int n, unsigned long v)
 }
 #endif
 
-#define KG_ABI		7
+#define KG_ABI		8
 #define KG_MAX_APPS	512
 #define KG_SEEN_MAX	256
 #define KG_APP_MIN	10000
@@ -92,6 +92,32 @@ static struct kg_table __rcu *kg_table;
 static DEFINE_MUTEX(kg_lock);
 static bool kg_sealed;
 static u8 kg_default;
+static u8 kg_sys_flags;
+
+static const char * const kg_sys_skip[] = {
+	"system_server",
+	"zygote",
+	"zygote64",
+	"main",
+	"app_process",
+	"app_process64",
+};
+
+static u8 kg_sys_now(void)
+{
+	u8 f = READ_ONCE(kg_sys_flags);
+	size_t i;
+
+	if (!f)
+		return 0;
+
+	for (i = 0; i < ARRAY_SIZE(kg_sys_skip); i++) {
+		if (!strcmp(current->comm, kg_sys_skip[i]))
+			return 0;
+	}
+
+	return f;
+}
 
 static u32 kg_seen[KG_SEEN_MAX];
 static u8 kg_seen_why[KG_SEEN_MAX];
@@ -120,7 +146,7 @@ static u8 kg_flags_now(u32 *out_appid)
 
 	appid = from_kuid(&init_user_ns, current_uid()) % KG_USER_OFF;
 	if (appid < KG_APP_MIN || appid > KG_APP_MAX)
-		return 0;
+		return kg_sys_now();
 
 	if (out_appid)
 		*out_appid = appid;
@@ -840,7 +866,7 @@ static void kg_update_key(struct kg_table *t)
 	bool on;
 	int i;
 
-	on = READ_ONCE(kg_default) != 0;
+	on = READ_ONCE(kg_default) != 0 || READ_ONCE(kg_sys_flags) != 0;
 
 	if (!on && t) {
 		for (i = 0; i < t->count; i++) {
@@ -886,6 +912,24 @@ static int kg_set_default(u32 flags)
 	WRITE_ONCE(kg_default, (u8)flags);
 	t = rcu_dereference_protected(kg_table, lockdep_is_held(&kg_lock));
 	kg_update_key(t);
+	mutex_unlock(&kg_lock);
+
+	return 0;
+}
+
+static int kg_set_sys(u32 flags)
+{
+	if (flags > KG_FLAG_ALL)
+		return -EINVAL;
+
+	mutex_lock(&kg_lock);
+	if (kg_sealed) {
+		mutex_unlock(&kg_lock);
+		return -EPERM;
+	}
+	WRITE_ONCE(kg_sys_flags, (u8)flags);
+	kg_update_key(rcu_dereference_protected(kg_table,
+					       lockdep_is_held(&kg_lock)));
 	mutex_unlock(&kg_lock);
 
 	return 0;
@@ -999,6 +1043,7 @@ static int kg_clear(void)
 	}
 
 	WRITE_ONCE(kg_default, 0);
+	WRITE_ONCE(kg_sys_flags, 0);
 	kg_publish(t);
 	mutex_unlock(&kg_lock);
 
@@ -1061,6 +1106,8 @@ static ssize_t kg_proc_read(struct file *file, char __user *ubuf,
 	n += scnprintf(out + n, KG_OUT_MAX - n, "sealed %d\n", kg_sealed ? 1 : 0);
 	n += scnprintf(out + n, KG_OUT_MAX - n, "default %u\n",
 		       READ_ONCE(kg_default));
+	n += scnprintf(out + n, KG_OUT_MAX - n, "sys %u\n",
+		       READ_ONCE(kg_sys_flags));
 	n += scnprintf(out + n, KG_OUT_MAX - n, "count %d\n", t ? t->count : 0);
 	n += kg_art_report(out + n, KG_OUT_MAX - n);
 	if (t) {
@@ -1111,6 +1158,8 @@ static ssize_t kg_proc_write(struct file *file, const char __user *ubuf,
 		ret = kg_del(appid);
 	else if (strcmp(verb, "default") == 0 && got >= 2)
 		ret = kg_set_default(appid);
+	else if (strcmp(verb, "sys") == 0 && got >= 2)
+		ret = kg_set_sys(appid);
 	else if (strcmp(verb, "clear") == 0)
 		ret = kg_clear();
 	else if (strcmp(verb, "seal") == 0)
