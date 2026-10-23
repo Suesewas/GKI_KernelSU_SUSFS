@@ -62,6 +62,7 @@ DEX_HOOK = (
 CRED_MAKEFILE_LINE = "obj-y += kg_cred.o\n"
 
 CRED_COMMIT_ANCHOR = "\ttrace_android_rvh_commit_creds(task, new);\n"
+CRED_COMMIT_ALT = "\trcu_assign_pointer(task->cred, new);\n"
 CRED_COMMIT_HOOK = (
     "\tif (static_branch_unlikely(&kg_cred_key))\n"
     "\t\tkg_cred_commit(task, new);\n"
@@ -184,7 +185,13 @@ def patch_cred(root):
         if CRED_INCLUDE_LINE not in src:
             src = insert_after(src, inc_anchor, CRED_INCLUDE_LINE,
                                "%s include" % rel)
-        src = insert_before(src, anchor, hook, "%s hook" % rel)
+        if rel == "kernel/cred.c" and src.count(anchor) != 1:
+            if src.count(CRED_COMMIT_ALT) != 1:
+                fail("kernel/cred.c: no usable anchor for the cred hook")
+            src = insert_after(src, CRED_COMMIT_ALT, hook,
+                               "kernel/cred.c hook")
+        else:
+            src = insert_before(src, anchor, hook, "%s hook" % rel)
         write(path, src)
         print("kgexec: patched %s" % rel)
 
