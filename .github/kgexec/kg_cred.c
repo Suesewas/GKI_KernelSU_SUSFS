@@ -30,6 +30,7 @@
 #define KG_APP_MIN	10000
 #define KG_APP_MAX	19999
 #define KG_SYS_MAX	9999
+#define KG_SYS_UID	1000
 
 #define KG_WHY_UID	1
 #define KG_WHY_CAPS	2
@@ -46,6 +47,7 @@ struct kg_cred_rec {
 	u64 start;
 	uid_t uid;
 	uid_t base;
+	bool sysserver;
 	kernel_cap_t eff;
 	kernel_cap_t perm;
 };
@@ -64,6 +66,44 @@ static DEFINE_SPINLOCK(kg_cred_last_lock);
 
 static u32 kg_trust[KG_TRUST_MAX];
 static int kg_trust_n;
+
+static bool kg_parent_is_init(struct task_struct *task)
+{
+	struct task_struct *p;
+	pid_t ppid = 0;
+
+	if (!task)
+		return false;
+
+	rcu_read_lock();
+	p = rcu_dereference(task->real_parent);
+	if (p)
+		ppid = task_pid_nr(p);
+	rcu_read_unlock();
+
+	return ppid == 1;
+}
+
+static uid_t kg_parent_uid(struct task_struct *task)
+{
+	struct task_struct *p;
+	const struct cred *c;
+	uid_t uid = (uid_t)-1;
+
+	if (!task)
+		return uid;
+
+	rcu_read_lock();
+	p = rcu_dereference(task->real_parent);
+	if (p) {
+		c = __task_cred(p);
+		if (c)
+			uid = from_kuid(&init_user_ns, c->uid);
+	}
+	rcu_read_unlock();
+
+	return uid;
+}
 
 static inline u32 kg_cred_slot(pid_t pid)
 {
@@ -165,6 +205,7 @@ static void kg_cred_store(struct task_struct *task, uid_t uid,
 	fresh->start = start;
 	fresh->uid = uid;
 	fresh->base = uid;
+	fresh->sysserver = false;
 	fresh->eff = eff;
 	fresh->perm = perm;
 	hlist_add_head_rcu(&fresh->node, &kg_cred_tab[kg_cred_slot(pid)]);
@@ -261,6 +302,39 @@ void kg_cred_commit(struct task_struct *task, const struct cred *new)
 
 	kg_cred_store(task, newuid, new->cap_effective, new->cap_permitted,
 		      true);
+
+	if (newuid == KG_SYS_UID && base == 0 && !kg_parent_is_init(task) &&
+	    kg_parent_uid(task) == 0) {
+		rcu_read_lock();
+		r = kg_cred_find(task_pid_nr(task), task->start_time);
+		if (r)
+			WRITE_ONCE(r->sysserver, true);
+		rcu_read_unlock();
+		pr_info_ratelimited("kg_cred: pid %d marked as system_server\n",
+				    task_pid_nr(task));
+	}
+}
+
+bool kg_cred_active(void)
+{
+	return static_branch_unlikely(&kg_cred_key) ? true : false;
+}
+
+bool kg_cred_is_system_server(void)
+{
+	struct kg_cred_rec *r;
+	bool mark = false;
+
+	if (!static_branch_unlikely(&kg_cred_key))
+		return false;
+
+	rcu_read_lock();
+	r = kg_cred_find(task_pid_nr(current), current->start_time);
+	if (r)
+		mark = READ_ONCE(r->sysserver);
+	rcu_read_unlock();
+
+	return mark;
 }
 
 void kg_cred_exit(struct task_struct *task)
@@ -358,6 +432,9 @@ bool kg_cred_block_exec(const char *path)
 	if (uid == 0 || uid > KG_SYS_MAX)
 		return false;
 
+	if (kg_parent_is_init(current))
+		return false;
+
 	pr_warn_ratelimited("kg_cred: pid %d comm %s uid %u exec %s\n",
 			    task_pid_nr(current), current->comm, uid,
 			    path ? path : "?");
@@ -441,7 +518,7 @@ static int kg_cred_show(struct seq_file *m, void *v)
 	unsigned long flags;
 	int i, n;
 
-	seq_puts(m, "abi 2\n");
+	seq_puts(m, "abi 3\n");
 	seq_printf(m, "on %d\n",
 		   static_key_enabled(&kg_cred_key.key) ? 1 : 0);
 	seq_printf(m, "enforce %d\n", READ_ONCE(kg_cred_enforce) ? 1 : 0);

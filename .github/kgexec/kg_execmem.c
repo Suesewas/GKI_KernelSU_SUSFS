@@ -12,6 +12,7 @@
 #include <linux/gfp.h>
 #include <linux/init.h>
 #include <linux/jump_label.h>
+#include <linux/kg_cred.h>
 #include <linux/kernel.h>
 #include <linux/magic.h>
 #include <linux/mm.h>
@@ -57,10 +58,12 @@ static inline void kg_art_set_arg(struct pt_regs *regs, int n, unsigned long v)
 }
 #endif
 
-#define KG_ABI		8
+#define KG_ABI		9
 #define KG_MAX_APPS	512
 #define KG_SEEN_MAX	256
 #define KG_APP_MIN	10000
+#define KG_SYS_MIN	1000
+#define KG_SYS_MAX	9999
 #define KG_APP_MAX	19999
 #define KG_USER_OFF	100000
 #define KG_FLAG_MEM	1
@@ -93,27 +96,21 @@ static bool kg_sealed;
 static u8 kg_default;
 static u8 kg_sys_flags;
 
-static const char * const kg_sys_skip[] = {
-	"system_server",
-	"zygote",
-	"zygote64",
-	"main",
-	"app_process",
-	"app_process64",
-};
-
-static u8 kg_sys_now(void)
+static u8 kg_sys_now(u32 uid)
 {
 	u8 f = READ_ONCE(kg_sys_flags);
-	size_t i;
 
 	if (!f)
 		return 0;
 
-	for (i = 0; i < ARRAY_SIZE(kg_sys_skip); i++) {
-		if (!strcmp(current->comm, kg_sys_skip[i]))
-			return 0;
-	}
+	if (uid < KG_SYS_MIN || uid > KG_SYS_MAX)
+		return 0;
+
+	if (!kg_cred_active())
+		return 0;
+
+	if (kg_cred_is_system_server())
+		return 0;
 
 	return f;
 }
@@ -145,7 +142,7 @@ static u8 kg_flags_now(u32 *out_appid)
 
 	appid = from_kuid(&init_user_ns, current_uid()) % KG_USER_OFF;
 	if (appid < KG_APP_MIN)
-		return kg_sys_now();
+		return kg_sys_now(appid);
 	if (appid > KG_APP_MAX)
 		return 0;
 
