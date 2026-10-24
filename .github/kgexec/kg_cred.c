@@ -56,6 +56,7 @@ static struct hlist_head kg_cred_tab[KG_CRED_SLOTS];
 static DEFINE_SPINLOCK(kg_cred_lock);
 static atomic_t kg_cred_recs = ATOMIC_INIT(0);
 static atomic_t kg_cred_hits = ATOMIC_INIT(0);
+static atomic_t kg_cred_notes = ATOMIC_INIT(0);
 static atomic_t kg_cred_kills = ATOMIC_INIT(0);
 static bool kg_cred_enforce;
 static bool kg_cred_root;
@@ -66,6 +67,41 @@ static DEFINE_SPINLOCK(kg_cred_last_lock);
 
 static u32 kg_trust[KG_TRUST_MAX];
 static int kg_trust_n;
+
+static const char * const kg_exec_dirs[] = {
+	"/system/",
+	"/system_ext/",
+	"/product/",
+	"/vendor/",
+	"/odm/",
+	"/apex/",
+	"/bin/",
+	"/sbin/",
+};
+
+static bool kg_caps_empty(kernel_cap_t c)
+{
+	kernel_cap_t zero;
+
+	memset(&zero, 0, sizeof(zero));
+
+	return memcmp(&c, &zero, sizeof(c)) == 0;
+}
+
+static bool kg_exec_system_path(const char *path)
+{
+	size_t i;
+
+	if (!path || *path != '/')
+		return false;
+
+	for (i = 0; i < ARRAY_SIZE(kg_exec_dirs); i++) {
+		if (!strncmp(path, kg_exec_dirs[i], strlen(kg_exec_dirs[i])))
+			return true;
+	}
+
+	return false;
+}
 
 static bool kg_parent_is_init(struct task_struct *task)
 {
@@ -236,7 +272,10 @@ static void kg_cred_note(u8 why, uid_t was, uid_t now, const char *what)
 static bool kg_cred_react(u8 why, uid_t was, uid_t now, const char *what,
 			  bool enforce)
 {
-	atomic_inc(&kg_cred_hits);
+	if (why == KG_WHY_MODULE || why == KG_WHY_EXEC)
+		atomic_inc(&kg_cred_notes);
+	else
+		atomic_inc(&kg_cred_hits);
 	kg_cred_note(why, was, now, what);
 
 	if (!enforce)
@@ -303,15 +342,22 @@ void kg_cred_commit(struct task_struct *task, const struct cred *new)
 	kg_cred_store(task, newuid, new->cap_effective, new->cap_permitted,
 		      true);
 
-	if (newuid == KG_SYS_UID && base == 0 && !kg_parent_is_init(task) &&
-	    kg_parent_uid(task) == 0) {
+	if (newuid == KG_SYS_UID && base == 0 &&
+	    !kg_caps_empty(new->cap_permitted) &&
+	    !kg_parent_is_init(task) && kg_parent_uid(task) == 0) {
+		bool fresh = false;
+
 		rcu_read_lock();
 		r = kg_cred_find(task_pid_nr(task), task->start_time);
-		if (r)
+		if (r && !READ_ONCE(r->sysserver)) {
 			WRITE_ONCE(r->sysserver, true);
+			fresh = true;
+		}
 		rcu_read_unlock();
-		pr_info_ratelimited("kg_cred: pid %d marked as system_server\n",
-				    task_pid_nr(task));
+
+		if (fresh)
+			pr_info("kg_cred: pid %d marked as system_server\n",
+				task_pid_nr(task));
 	}
 }
 
@@ -435,6 +481,9 @@ bool kg_cred_block_exec(const char *path)
 	if (kg_parent_is_init(current))
 		return false;
 
+	if (kg_exec_system_path(path))
+		return false;
+
 	pr_warn_ratelimited("kg_cred: pid %d comm %s uid %u exec %s\n",
 			    task_pid_nr(current), current->comm, uid,
 			    path ? path : "?");
@@ -527,6 +576,7 @@ static int kg_cred_show(struct seq_file *m, void *v)
 	seq_printf(m, "exec %u\n", READ_ONCE(kg_exec_mode));
 	seq_printf(m, "tracked %d\n", atomic_read(&kg_cred_recs));
 	seq_printf(m, "hits %d\n", atomic_read(&kg_cred_hits));
+	seq_printf(m, "notes %d\n", atomic_read(&kg_cred_notes));
 	seq_printf(m, "kills %d\n", atomic_read(&kg_cred_kills));
 
 	n = READ_ONCE(kg_trust_n);
@@ -535,6 +585,7 @@ static int kg_cred_show(struct seq_file *m, void *v)
 	seq_printf(m, "trusted %d\n", n);
 	for (i = 0; i < n; i++)
 		seq_printf(m, "trust %u\n", READ_ONCE(kg_trust[i]));
+
 
 	spin_lock_irqsave(&kg_cred_last_lock, flags);
 	if (kg_cred_last[0])
