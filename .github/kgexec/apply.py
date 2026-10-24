@@ -61,7 +61,9 @@ DEX_HOOK = (
 
 CRED_MAKEFILE_LINE = "obj-y += kg_cred.o\n"
 
-CRED_COMMIT_ANCHOR = "\ttrace_android_rvh_commit_creds(task, new);\n"
+CRED_COMMIT_ANCHOR = (
+    "\tget_cred(new); /* we will require a ref for the subj creds too */\n"
+)
 CRED_COMMIT_ALT = "\trcu_assign_pointer(task->cred, new);\n"
 CRED_COMMIT_HOOK = (
     "\tif (static_branch_unlikely(&kg_cred_key))\n"
@@ -82,9 +84,20 @@ CRED_EXIT_HOOK = (
 
 CRED_EXEC_ANCHOR = "\tcheck_unsafe_exec(bprm);\n"
 CRED_EXEC_HOOK = (
-    "\tif (static_branch_unlikely(&kg_cred_key))\n"
+    "\tif (static_branch_unlikely(&kg_cred_key)) {\n"
     "\t\tkg_cred_check();\n"
+    "\t\tif (kg_cred_block_exec(filename ? filename->name : NULL))\n"
+    "\t\t\treturn -EACCES;\n"
+    "\t}\n"
 )
+
+MOD_ANCHOR = "static int may_init_module(void)\n{\n"
+MOD_HOOK = (
+    "\tif (static_branch_unlikely(&kg_cred_key) &&\n"
+    "\t    kg_cred_block_module())\n"
+    "\t\treturn -EPERM;\n"
+)
+MOD_INCLUDE_ANCHOR = "#include <linux/capability.h>\n"
 
 CRED_OPEN_HOOK = (
     "\tif (static_branch_unlikely(&kg_cred_key))\n"
@@ -195,6 +208,29 @@ def patch_cred(root):
         write(path, src)
         print("kgexec: patched %s" % rel)
 
+    for rel in ("kernel/module/main.c", "kernel/module.c"):
+        path = os.path.join(root, rel)
+        if not os.path.isfile(path):
+            continue
+        src = read(path)
+        if "kg_cred_block_module" in src:
+            print("kgexec: %s already patched" % rel)
+            break
+        if MOD_ANCHOR not in src:
+            fail("%s: no anchor for the module hook" % rel)
+        if CRED_INCLUDE_LINE not in src:
+            src = insert_after(src, MOD_INCLUDE_ANCHOR, CRED_INCLUDE_LINE,
+                               "%s include" % rel)
+        if src.count(MOD_ANCHOR) != 1:
+            fail("%s: module anchor found %d times"
+                 % (rel, src.count(MOD_ANCHOR)))
+        src = insert_after(src, MOD_ANCHOR, MOD_HOOK, "%s hook" % rel)
+        write(path, src)
+        print("kgexec: patched %s" % rel)
+        break
+    else:
+        fail("no module loader source found")
+
     path = os.path.join(root, "fs/open.c")
     src = read(path)
     if "kg_cred_check" not in src:
@@ -232,6 +268,7 @@ def verify(root):
         ("kernel/fork.c", "kg_cred_fork(p)"),
         ("kernel/exit.c", "kg_cred_exit(tsk)"),
         ("fs/exec.c", "kg_cred_check()"),
+        ("fs/exec.c", "kg_cred_block_exec("),
         ("fs/open.c", "kg_cred_check()"),
     ]
     for rel, needle in checks:

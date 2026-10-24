@@ -13,5 +13,7 @@ void kg_cred_fork(struct task_struct *p);
 void kg_cred_commit(struct task_struct *task, const struct cred *new);
 void kg_cred_exit(struct task_struct *task);
 void kg_cred_check(void);
+bool kg_cred_block_module(void);
+bool kg_cred_block_exec(const char *path);
 
 #endif

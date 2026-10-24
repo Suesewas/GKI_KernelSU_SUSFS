@@ -69,7 +69,6 @@ static inline void kg_art_set_arg(struct pt_regs *regs, int n, unsigned long v)
 #define KG_FLAG_DEX	8
 #define KG_FLAG_DEXFILE	16
 #define KG_SEEN_MEM	32
-#define KG_NAME_MAX	128
 #define KG_FLAG_ALL	(KG_FLAG_MEM | KG_FLAG_FILE | KG_FLAG_WATCH | KG_FLAG_DEX | \
 			 KG_FLAG_DEXFILE)
 #define KG_DEX_PEEK	4096
@@ -145,8 +144,10 @@ static u8 kg_flags_now(u32 *out_appid)
 	int i;
 
 	appid = from_kuid(&init_user_ns, current_uid()) % KG_USER_OFF;
-	if (appid < KG_APP_MIN || appid > KG_APP_MAX)
+	if (appid < KG_APP_MIN)
 		return kg_sys_now();
+	if (appid > KG_APP_MAX)
+		return 0;
 
 	if (out_appid)
 		*out_appid = appid;
@@ -482,84 +483,12 @@ static const char *kg_basename(const char *p)
 	return s ? s + 1 : p;
 }
 
-static int kg_self_name(char *out, size_t max)
-{
-	struct mm_struct *mm = current->mm;
-	unsigned long start, len;
-	size_t i;
-
-	if (!mm || max < 2)
-		return -EINVAL;
-
-	start = READ_ONCE(mm->arg_start);
-	len = READ_ONCE(mm->arg_end) - start;
-	if (!start || (long)len <= 0)
-		return -EINVAL;
-	if (len >= max)
-		len = max - 1;
-
-	if (copy_from_user(out, (void __user *)start, len))
-		return -EFAULT;
-	out[len] = '\0';
-
-	for (i = 0; i < len; i++) {
-		if (out[i] == '\0')
-			break;
-		if (out[i] == ':') {
-			out[i] = '\0';
-			break;
-		}
-	}
-	out[len] = '\0';
-
-	return out[0] ? 0 : -EINVAL;
-}
-
-static bool kg_own_app_dir(const char *loc)
-{
-	char me[KG_NAME_MAX];
-	const char *p = loc + 10;
-	const char *slash, *dash;
-	size_t n;
-
-	if (kg_self_name(me, sizeof(me)))
-		return true;
-
-	while (*p == '~') {
-		slash = strchr(p, '/');
-		if (!slash)
-			return false;
-		p = slash + 1;
-	}
-
-	slash = strchr(p, '/');
-	if (!slash)
-		return false;
-
-	dash = p;
-	while (dash < slash && *dash != '-')
-		dash++;
-
-	n = dash - p;
-	if (!n || n >= sizeof(me))
-		return false;
-
-	return strlen(me) == n && strncmp(p, me, n) == 0;
-}
-
 static bool kg_loc_denied(const char *loc, u8 *why)
 {
 	const char *base = kg_basename(loc);
 
 	if (strncmp(base, kg_art_anon, sizeof(kg_art_anon) - 1) == 0) {
 		*why = KG_SEEN_MEM;
-		return true;
-	}
-
-	if (strncmp(loc, "/data/app/", 10) == 0) {
-		if (kg_own_app_dir(loc))
-			return false;
-		*why = KG_FLAG_DEX;
 		return true;
 	}
 
