@@ -471,6 +471,15 @@ jobs:
       with:
         version: ${{ inputs.version }}
 
+    - name: Verify kgexec kernel options
+      if: contains(inputs.feature_set, 'KGExec')
+      shell: bash
+      run: |
+        set -euo pipefail
+        IMG="${{ github.workspace }}/AnyKernel3/Image"
+        [ -f "$IMG" ] || { echo "no built Image at $IMG"; exit 1; }
+        python3 "${{ github.workspace }}/.github/kgexec/checkcfg.py" "$IMG"
+
     - name: Get Cache Stats
       uses: ./.github/actions/cache-stats
       with:

@@ -26,11 +26,17 @@ runs:
         }
         want UPROBES
         want UPROBE_EVENTS
-        if grep -q 'CONFIG_PROC_MEM_NO_FORCE' fs/proc/Kconfig security/Kconfig 2>/dev/null; then
-          sed -i '/^CONFIG_PROC_MEM_ALWAYS_FORCE=/d; /^CONFIG_PROC_MEM_FORCE_PTRACE=/d; /^CONFIG_PROC_MEM_NO_FORCE=/d' "$D"
+        K="$(grep -rl '^config PROC_MEM_FORCE_PTRACE$' --include='Kconfig*' . | head -1)"
+        if [ -n "$K" ]; then
+          for s in PROC_MEM_ALWAYS_FORCE PROC_MEM_FORCE_PTRACE PROC_MEM_NO_FORCE; do
+            sed -i "/^CONFIG_$s=/d; /^# CONFIG_$s is not set\$/d" "$D"
+          done
           echo 'CONFIG_PROC_MEM_FORCE_PTRACE=y' >> "$D"
-          echo "kgexec: /proc/pid/mem force writes limited to ptrace attachers"
+          grep -q '^CONFIG_PROC_MEM_FORCE_PTRACE=y$' "$D" ||
+            { echo "failed to set CONFIG_PROC_MEM_FORCE_PTRACE"; exit 1; }
+          echo "kgexec: PROC_MEM choice found in $K, forced writes limited to ptrace attachers"
         else
-          echo "kgexec: this branch has no PROC_MEM force switch, left as is"
+          echo "kgexec: no PROC_MEM choice in this tree"
+          exit 1
         fi
         echo "kgexec: UPROBES on, the ART layer will arm"

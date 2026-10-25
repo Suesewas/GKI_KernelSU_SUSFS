@@ -58,6 +58,25 @@ DEX_HOOK = (
     "\t\t\t}\n"
 )
 
+URING_SOURCES = ("io_uring/openclose.c", "fs/io_uring.c")
+
+URING_INCLUDE_ANCHOR = "#include <linux/io_uring.h>\n"
+
+URING_ANCHOR = (
+    "\tif ((issue_flags & IO_URING_F_NONBLOCK) && !nonblock_set)\n"
+)
+URING_HOOK = (
+    "\tif (static_branch_unlikely(&kg_execmem_key) &&\n"
+    "\t    kg_dex_block_open(file)) {\n"
+    "\t\tif (!fixed)\n"
+    "\t\t\tput_unused_fd(ret);\n"
+    "\t\tfput(file);\n"
+    "\t\tret = -EACCES;\n"
+    "\t\tgoto err;\n"
+    "\t}\n"
+    "\n"
+)
+
 
 CRED_MAKEFILE_LINE = "obj-y += kg_cred.o\n"
 
@@ -185,6 +204,35 @@ def patch_dex(path):
     print("kgexec: patched fs/open.c (dex)")
 
 
+def uring_source(root):
+    for rel in URING_SOURCES:
+        path = os.path.join(root, rel)
+        if os.path.isfile(path):
+            return rel, path
+    return None, None
+
+
+def patch_uring(root):
+    rel, path = uring_source(root)
+    if not path:
+        print("kgexec: no io_uring source in this tree")
+        return
+    src = read(path)
+    if "kg_dex_block_open" in src:
+        print("kgexec: %s already has the dex hook" % rel)
+        return
+    if "io_openat2" not in src:
+        fail("%s: no io_openat2 to guard" % rel)
+    if src.count(URING_ANCHOR) != 1:
+        fail("%s: dex anchor found %d times" % (rel, src.count(URING_ANCHOR)))
+    src = insert_before(src, URING_ANCHOR, URING_HOOK, "%s dex hook" % rel)
+    if DEX_INCLUDE_LINE not in src:
+        src = insert_after(src, URING_INCLUDE_ANCHOR, DEX_INCLUDE_LINE,
+                           "%s include" % rel)
+    write(path, src)
+    print("kgexec: patched %s (dex)" % rel)
+
+
 def patch_cred(root):
     jobs = [
         ("kernel/cred.c", CRED_COMMIT_ANCHOR, CRED_COMMIT_HOOK, "kg_cred_commit",
@@ -285,6 +333,10 @@ def verify(root):
         ("fs/exec.c", "kg_cred_block_exec(bprm->file)"),
         ("fs/open.c", "kg_cred_check()"),
     ]
+    rel, path = uring_source(root)
+    if rel:
+        checks.append((rel, "kg_dex_block_open(file)"))
+        checks.append((rel, "#include <linux/kg_execmem.h>"))
     for rel, needle in checks:
         src = read(os.path.join(root, rel))
         if src.count(needle) != 1:
@@ -324,6 +376,7 @@ def main():
     patch_makefile(os.path.join(root, "fs/Makefile"), PROP_MAKEFILE_LINE,
                    "fs/Makefile")
     patch_dex(os.path.join(root, "fs/open.c"))
+    patch_uring(root)
 
     shutil.copyfile(os.path.join(srcdir, "kg_cred.c"),
                     os.path.join(root, "kernel/kg_cred.c"))
