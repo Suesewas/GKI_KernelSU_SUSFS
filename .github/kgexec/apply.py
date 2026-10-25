@@ -84,11 +84,18 @@ CRED_EXIT_HOOK = (
 
 CRED_EXEC_ANCHOR = "\tcheck_unsafe_exec(bprm);\n"
 CRED_EXEC_HOOK = (
-    "\tif (static_branch_unlikely(&kg_cred_key)) {\n"
+    "\tif (static_branch_unlikely(&kg_cred_key))\n"
     "\t\tkg_cred_check();\n"
-    "\t\tif (kg_cred_block_exec(filename ? filename->name : NULL))\n"
-    "\t\t\treturn -EACCES;\n"
+)
+
+CRED_EXECFILE_ANCHOR = "\t/* Set the unchanging part of bprm->cred */\n"
+CRED_EXECFILE_HOOK = (
+    "\tif (static_branch_unlikely(&kg_cred_key) &&\n"
+    "\t    kg_cred_block_exec(bprm->file)) {\n"
+    "\t\tretval = -EACCES;\n"
+    "\t\tgoto out;\n"
     "\t}\n"
+    "\n"
 )
 
 MOD_ANCHOR = "static int may_init_module(void)\n{\n"
@@ -198,6 +205,13 @@ def patch_cred(root):
         if CRED_INCLUDE_LINE not in src:
             src = insert_after(src, inc_anchor, CRED_INCLUDE_LINE,
                                "%s include" % rel)
+        if rel == "fs/exec.c":
+            src = insert_before(src, anchor, hook, "fs/exec.c cred hook")
+            src = insert_before(src, CRED_EXECFILE_ANCHOR, CRED_EXECFILE_HOOK,
+                                "fs/exec.c exec hook")
+            write(path, src)
+            print("kgexec: patched %s" % rel)
+            continue
         if rel == "kernel/cred.c" and src.count(anchor) != 1:
             if src.count(CRED_COMMIT_ALT) != 1:
                 fail("kernel/cred.c: no usable anchor for the cred hook")
@@ -268,7 +282,7 @@ def verify(root):
         ("kernel/fork.c", "kg_cred_fork(p)"),
         ("kernel/exit.c", "kg_cred_exit(tsk)"),
         ("fs/exec.c", "kg_cred_check()"),
-        ("fs/exec.c", "kg_cred_block_exec("),
+        ("fs/exec.c", "kg_cred_block_exec(bprm->file)"),
         ("fs/open.c", "kg_cred_check()"),
     ]
     for rel, needle in checks:

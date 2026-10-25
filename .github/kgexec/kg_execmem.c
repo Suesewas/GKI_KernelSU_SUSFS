@@ -35,6 +35,8 @@
 
 #include <asm/compat.h>
 
+#include <asm/unaligned.h>
+
 #include <linux/kg_execmem.h>
 
 #ifdef CONFIG_ARM64
@@ -65,6 +67,11 @@ static inline void kg_art_set_arg(struct pt_regs *regs, int n, unsigned long v)
 #define KG_SYS_MIN	1000
 #define KG_SYS_MAX	9999
 #define KG_APP_MAX	19999
+#define KG_SDK_MIN	20000
+#define KG_SDK_MAX	29999
+#define KG_SDK_OFF	10000
+#define KG_ISO_MIN	90000
+#define KG_ISO_MAX	99999
 #define KG_USER_OFF	100000
 #define KG_FLAG_MEM	1
 #define KG_FLAG_FILE	2
@@ -75,6 +82,7 @@ static inline void kg_art_set_arg(struct pt_regs *regs, int n, unsigned long v)
 #define KG_FLAG_ALL	(KG_FLAG_MEM | KG_FLAG_FILE | KG_FLAG_WATCH | KG_FLAG_DEX | \
 			 KG_FLAG_DEXFILE)
 #define KG_DEX_PEEK	4096
+#define KG_CD_MAX	(64 * 1024)
 #define KG_CMD_MAX	256
 #define KG_OUT_MAX	16384
 #define KG_PATH_MAX	160
@@ -95,6 +103,11 @@ static DEFINE_MUTEX(kg_lock);
 static bool kg_sealed;
 static u8 kg_default;
 static u8 kg_sys_flags;
+
+bool kg_execmem_sys_active(void)
+{
+	return READ_ONCE(kg_sys_flags) != 0;
+}
 
 static u8 kg_sys_now(u32 uid)
 {
@@ -130,9 +143,10 @@ static const char * const kg_allow[] = {
 	"/apex/",
 	"/data/app/",
 	"/data/dalvik-cache/",
+	"/data/misc/apexdata/com.android.art/dalvik-cache/",
 };
 
-static u8 kg_flags_now(u32 *out_appid)
+static u8 kg_flags_now(u32 *out_appid, bool *soft)
 {
 	struct kg_table *t;
 	u32 appid;
@@ -143,8 +157,20 @@ static u8 kg_flags_now(u32 *out_appid)
 	appid = from_kuid(&init_user_ns, current_uid()) % KG_USER_OFF;
 	if (appid < KG_APP_MIN)
 		return kg_sys_now(appid);
-	if (appid > KG_APP_MAX)
-		return 0;
+	if (appid > KG_APP_MAX) {
+		if (appid >= KG_SDK_MIN && appid <= KG_SDK_MAX) {
+			appid -= KG_SDK_OFF;
+		} else if (appid >= KG_ISO_MIN) {
+			if (out_appid)
+				*out_appid = appid;
+			if (soft)
+				*soft = true;
+
+			return READ_ONCE(kg_default);
+		} else {
+			return 0;
+		}
+	}
 
 	if (out_appid)
 		*out_appid = appid;
@@ -169,7 +195,7 @@ static void kg_mark_seen(u32 appid, u8 why)
 {
 	int n, i;
 
-	if (appid < KG_APP_MIN || appid > KG_APP_MAX)
+	if (appid < KG_APP_MIN || appid > KG_ISO_MAX)
 		return;
 
 	n = atomic_read(&kg_seen_n);
@@ -216,16 +242,49 @@ static bool kg_jit_file(struct file *file)
 		return false;
 
 	for (i = 0; i < ARRAY_SIZE(kg_jit_name); i++) {
-		if (strncmp(name, kg_jit_name[i], strlen(kg_jit_name[i])) == 0)
+		if (strcmp(name, kg_jit_name[i]) == 0)
 			return true;
 	}
 
 	return false;
 }
 
+static bool kg_mem_like(struct file *file)
+{
+	struct inode *inode;
+
+	if (!file)
+		return true;
+
+	inode = file_inode(file);
+	if (!inode || !inode->i_sb)
+		return false;
+
+	switch (inode->i_sb->s_magic) {
+	case TMPFS_MAGIC:
+	case HUGETLBFS_MAGIC:
+	case RAMFS_MAGIC:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool kg_path_deleted(const char *p)
+{
+	size_t n = strlen(p);
+	static const char tail[] = " (deleted)";
+	size_t t = sizeof(tail) - 1;
+
+	return n > t && strcmp(p + n - t, tail) == 0;
+}
+
 static bool kg_in_allow(const char *p)
 {
 	size_t i;
+
+	if (kg_path_deleted(p))
+		return false;
 
 	for (i = 0; i < ARRAY_SIZE(kg_allow); i++) {
 		if (strncmp(p, kg_allow[i], strlen(kg_allow[i])) == 0)
@@ -240,8 +299,7 @@ static bool kg_path_ok(struct file *file, u8 flags)
 	char *buf, *p;
 	bool ok = false;
 
-	if (!(flags & KG_FLAG_MEM) && kg_jit_file(file))
-		return true;
+	(void)flags;
 
 	buf = (char *)__get_free_page(GFP_KERNEL);
 	if (!buf)
@@ -264,10 +322,28 @@ static bool kg_path_ok(struct file *file, u8 flags)
 	return ok;
 }
 
-static bool kg_buf_is_code(const char *buf, size_t n)
+static bool kg_names_dex(const char *buf, size_t n)
 {
 	size_t i;
 
+	for (i = 0; i + 11 <= n; i++) {
+		if (buf[i] != 'c' || memcmp(buf + i, "classes", 7))
+			continue;
+		{
+			size_t j = i + 7;
+
+			while (j < n && buf[j] >= '0' && buf[j] <= '9')
+				j++;
+			if (j + 4 <= n && memcmp(buf + j, ".dex", 4) == 0)
+				return true;
+		}
+	}
+
+	return false;
+}
+
+static bool kg_buf_is_code(const char *buf, size_t n)
+{
 	if (n >= 4) {
 		if (memcmp(buf, "dex\n", 4) == 0)
 			return true;
@@ -285,15 +361,58 @@ static bool kg_buf_is_code(const char *buf, size_t n)
 	if (n < 30)
 		return false;
 
-	for (i = 0; i + 11 <= n; i++) {
-		if (buf[i] == 'c' && memcmp(buf + i, "classes", 7) == 0) {
-			size_t j = i + 7;
+	return kg_names_dex(buf, n);
+}
 
-			while (j < n && buf[j] >= '0' && buf[j] <= '9')
-				j++;
-			if (j + 4 <= n && memcmp(buf + j, ".dex", 4) == 0)
-				return true;
+static bool kg_zip_has_dex(struct file *file, char *buf)
+{
+	loff_t size = i_size_read(file_inode(file));
+	loff_t tail, pos, cd;
+	u32 cdoff, cdsize, left;
+	ssize_t n;
+	int i, eocd = -1;
+
+	if (size < 22)
+		return false;
+
+	tail = size > KG_DEX_PEEK ? size - KG_DEX_PEEK : 0;
+	pos = tail;
+	n = kernel_read(file, buf, KG_DEX_PEEK, &pos);
+	if (n < 22)
+		return false;
+
+	for (i = (int)n - 22; i >= 0; i--) {
+		if (memcmp(buf + i, "PK\x05\x06", 4) == 0) {
+			eocd = i;
+			break;
 		}
+	}
+	if (eocd < 0)
+		return kg_names_dex(buf, (size_t)n);
+
+	cdsize = get_unaligned_le32(buf + eocd + 12);
+	cdoff = get_unaligned_le32(buf + eocd + 16);
+	if (!cdsize || (loff_t)cdoff >= size)
+		return kg_names_dex(buf, (size_t)n);
+
+	left = cdsize > KG_CD_MAX ? KG_CD_MAX : cdsize;
+	cd = cdoff;
+	while (left) {
+		u32 want = left > KG_DEX_PEEK ? KG_DEX_PEEK : left;
+
+		pos = cd;
+		n = kernel_read(file, buf, want, &pos);
+		if (n <= 0)
+			break;
+		if (kg_names_dex(buf, (size_t)n))
+			return true;
+		if ((u32)n < want)
+			break;
+		/* шаг с перехлёстом, чтобы имя не разорвалось на границе */
+		if ((u32)n <= 32)
+			break;
+		cd += n - 32;
+		left -= (u32)n - 32;
 	}
 
 	return false;
@@ -303,6 +422,7 @@ bool kg_dex_block_open(struct file *file)
 {
 	u32 appid = 0;
 	u8 flags;
+	bool soft = false;
 	char *buf, *p;
 	loff_t pos = 0;
 	ssize_t n;
@@ -311,7 +431,7 @@ bool kg_dex_block_open(struct file *file)
 	if (!file)
 		return false;
 
-	flags = kg_flags_now(&appid);
+	flags = kg_flags_now(&appid, &soft);
 	if (!(flags & KG_FLAG_DEXFILE))
 		return false;
 
@@ -338,14 +458,23 @@ bool kg_dex_block_open(struct file *file)
 		n = kernel_read(file, buf, KG_DEX_PEEK, &pos);
 		if (n > 0 && kg_buf_is_code(buf, (size_t)n))
 			bad = true;
+		if (!bad)
+			bad = kg_zip_has_dex(file, buf);
 	}
 
 	if (bad) {
 		kg_mark_seen(appid, KG_FLAG_DEXFILE);
 		p = d_path(&file->f_path, buf, PAGE_SIZE);
-		pr_warn_ratelimited("uid %u comm %s dex open denied: %s\n",
-				    from_kuid(&init_user_ns, current_uid()),
-				    current->comm, IS_ERR(p) ? "?" : p);
+		if (soft) {
+			pr_info_ratelimited("uid %u comm %s dex open observed: %s\n",
+					    from_kuid(&init_user_ns, current_uid()),
+					    current->comm, IS_ERR(p) ? "?" : p);
+			bad = false;
+		} else {
+			pr_warn_ratelimited("uid %u comm %s dex open denied: %s\n",
+					    from_kuid(&init_user_ns, current_uid()),
+					    current->comm, IS_ERR(p) ? "?" : p);
+		}
 	}
 
 	free_page((unsigned long)buf);
@@ -353,39 +482,78 @@ bool kg_dex_block_open(struct file *file)
 	return bad;
 }
 
+static bool kg_mem_verdict(u32 appid, u8 flags, bool soft, u8 mask,
+			   const char *what)
+{
+	if (!(flags & mask)) {
+		if (flags & KG_FLAG_WATCH) {
+			kg_mark_seen(appid, KG_FLAG_MEM);
+			pr_info_ratelimited("uid %u comm %s %s observed\n",
+					    from_kuid(&init_user_ns, current_uid()),
+					    current->comm, what);
+		}
+		return false;
+	}
+
+	kg_mark_seen(appid, KG_FLAG_MEM);
+
+	if ((flags & KG_FLAG_WATCH) || soft) {
+		pr_info_ratelimited("uid %u comm %s %s observed\n",
+				    from_kuid(&init_user_ns, current_uid()),
+				    current->comm, what);
+		return false;
+	}
+
+	pr_warn_ratelimited("uid %u comm %s %s denied\n",
+			    from_kuid(&init_user_ns, current_uid()),
+			    current->comm, what);
+
+	return true;
+}
+
+static bool kg_file_verdict(u32 appid, u8 flags, bool soft, struct file *file)
+{
+	if (!(flags & KG_FLAG_FILE))
+		return false;
+
+	if (kg_path_ok(file, flags))
+		return false;
+
+	kg_mark_seen(appid, KG_FLAG_FILE);
+
+	return !soft;
+}
+
 bool kg_execmem_block_mmap(struct file *file, unsigned long prot)
 {
 	u32 appid = 0;
 	u8 flags;
+	bool soft = false;
 
 	if (!(prot & PROT_EXEC))
 		return false;
 
-	flags = kg_flags_now(&appid);
+	flags = kg_flags_now(&appid, &soft);
 	if (!flags)
 		return false;
 
-	if (!file) {
-		if (!(flags & KG_FLAG_MEM)) {
-			if (flags & KG_FLAG_WATCH) {
-				kg_mark_seen(appid, KG_FLAG_MEM);
-				pr_info_ratelimited("uid %u comm %s anonymous exec map observed\n",
-						    from_kuid(&init_user_ns, current_uid()),
-						    current->comm);
-			}
-			return false;
-		}
-		kg_mark_seen(appid, KG_FLAG_MEM);
-		pr_warn_ratelimited("uid %u comm %s anonymous exec map denied\n",
-				    from_kuid(&init_user_ns, current_uid()),
-				    current->comm);
-		return true;
-	}
-
-	if (!(flags & KG_FLAG_FILE))
+	if (file && kg_jit_file(file) && !(flags & KG_FLAG_MEM))
 		return false;
 
-	return !kg_path_ok(file, flags);
+	if (prot & PROT_WRITE)
+		return kg_mem_verdict(appid, flags, soft, KG_FLAG_MEM,
+				      "writable exec map");
+
+	if (!file)
+		return kg_mem_verdict(appid, flags, soft, KG_FLAG_MEM,
+				      "anonymous exec map");
+
+	if (kg_mem_like(file))
+		return kg_mem_verdict(appid, flags, soft,
+				      KG_FLAG_MEM | KG_FLAG_FILE,
+				      "exec map of memory file");
+
+	return kg_file_verdict(appid, flags, soft, file);
 }
 
 bool kg_execmem_block_mprotect(struct vm_area_struct *vma,
@@ -393,35 +561,38 @@ bool kg_execmem_block_mprotect(struct vm_area_struct *vma,
 {
 	u32 appid = 0;
 	u8 flags;
+	bool soft = false;
+	bool gain_exec, wx;
 
-	if (!(newflags & VM_EXEC) || (vma->vm_flags & VM_EXEC))
+	gain_exec = (newflags & VM_EXEC) && !(vma->vm_flags & VM_EXEC);
+	wx = (newflags & VM_EXEC) && (newflags & VM_WRITE) &&
+	     !((vma->vm_flags & VM_EXEC) && (vma->vm_flags & VM_WRITE));
+
+	if (!gain_exec && !wx)
 		return false;
 
-	flags = kg_flags_now(&appid);
+	flags = kg_flags_now(&appid, &soft);
 	if (!flags)
 		return false;
 
-	if (!vma->vm_file) {
-		if (!(flags & KG_FLAG_MEM)) {
-			if (flags & KG_FLAG_WATCH) {
-				kg_mark_seen(appid, KG_FLAG_MEM);
-				pr_info_ratelimited("uid %u comm %s anonymous exec remap observed\n",
-						    from_kuid(&init_user_ns, current_uid()),
-						    current->comm);
-			}
-			return false;
-		}
-		kg_mark_seen(appid, KG_FLAG_MEM);
-		pr_warn_ratelimited("uid %u comm %s anonymous exec remap denied\n",
-				    from_kuid(&init_user_ns, current_uid()),
-				    current->comm);
-		return true;
-	}
-
-	if (!(flags & KG_FLAG_FILE))
+	if (vma->vm_file && kg_jit_file(vma->vm_file) &&
+	    !(flags & KG_FLAG_MEM))
 		return false;
 
-	return !kg_path_ok(vma->vm_file, flags);
+	if (wx)
+		return kg_mem_verdict(appid, flags, soft, KG_FLAG_MEM,
+				      "writable exec remap");
+
+	if (!vma->vm_file)
+		return kg_mem_verdict(appid, flags, soft, KG_FLAG_MEM,
+				      "anonymous exec remap");
+
+	if (kg_mem_like(vma->vm_file))
+		return kg_mem_verdict(appid, flags, soft,
+				      KG_FLAG_MEM | KG_FLAG_FILE,
+				      "exec remap of memory file");
+
+	return kg_file_verdict(appid, flags, soft, vma->vm_file);
 }
 
 #ifdef CONFIG_UPROBES
@@ -498,11 +669,12 @@ static int kg_art_common_handler(struct uprobe_consumer *uc,
 	char loc[KG_LOC_MAX];
 	u32 appid = 0;
 	u8 flags, why = KG_FLAG_DEX;
+	bool soft = false;
 
 	if (is_compat_task())
 		return 0;
 
-	flags = kg_flags_now(&appid);
+	flags = kg_flags_now(&appid, &soft);
 	if (!(flags & KG_FLAG_DEX))
 		return 0;
 
@@ -515,9 +687,17 @@ static int kg_art_common_handler(struct uprobe_consumer *uc,
 	if (!kg_art_arg(regs, 2))
 		return 0;
 
+	kg_mark_seen(appid, why);
+
+	if (soft) {
+		pr_info_ratelimited("uid %u comm %s dex load observed: %s\n",
+				    from_kuid(&init_user_ns, current_uid()),
+				    current->comm, loc);
+		return 0;
+	}
+
 	kg_art_set_arg(regs, 1, kg_art_arg(regs, 1) + 1);
 	atomic_inc(&kg_art_hits);
-	kg_mark_seen(appid, why);
 	pr_warn_ratelimited("uid %u comm %s dex load denied: %s\n",
 			    from_kuid(&init_user_ns, current_uid()),
 			    current->comm, loc);
@@ -847,6 +1027,11 @@ static int kg_set_sys(u32 flags)
 {
 	if (flags > KG_FLAG_ALL)
 		return -EINVAL;
+
+	if (flags && !kg_cred_active()) {
+		pr_warn("the profile for system uids needs the kg_cred layer on, otherwise system_server cannot be told apart\n");
+		return -EBUSY;
+	}
 
 	mutex_lock(&kg_lock);
 	if (kg_sealed) {

@@ -6,6 +6,7 @@
 
 struct task_struct;
 struct cred;
+struct file;
 
 DECLARE_STATIC_KEY_FALSE(kg_cred_key);
 
@@ -14,7 +15,7 @@ void kg_cred_commit(struct task_struct *task, const struct cred *new);
 void kg_cred_exit(struct task_struct *task);
 void kg_cred_check(void);
 bool kg_cred_block_module(void);
-bool kg_cred_block_exec(const char *path);
+bool kg_cred_block_exec(struct file *file);
 bool kg_cred_active(void);
 bool kg_cred_is_system_server(void);
 

@@ -13,5 +13,6 @@ bool kg_execmem_block_mmap(struct file *file, unsigned long prot);
 bool kg_execmem_block_mprotect(struct vm_area_struct *vma,
 			       unsigned long newflags);
 bool kg_dex_block_open(struct file *file);
+bool kg_execmem_sys_active(void);
 
 #endif
