@@ -482,31 +482,41 @@ bool kg_dex_block_open(struct file *file)
 	return bad;
 }
 
-static bool kg_mem_verdict(u32 appid, u8 flags, bool soft, u8 mask,
-			   const char *what)
+static const char *kg_mem_name(struct file *file)
 {
+	if (!file || !file->f_path.dentry)
+		return "anon";
+
+	return (const char *)file->f_path.dentry->d_name.name;
+}
+
+static bool kg_mem_verdict(u32 appid, u8 flags, bool soft, u8 mask,
+			   const char *what, struct file *file)
+{
+	const char *src = kg_mem_name(file);
+
 	if (!(flags & mask)) {
 		if (flags & KG_FLAG_WATCH) {
 			kg_mark_seen(appid, KG_FLAG_MEM);
-			pr_info_ratelimited("uid %u comm %s %s observed\n",
+			pr_info_ratelimited("uid %u comm %s %s observed: %s\n",
 					    from_kuid(&init_user_ns, current_uid()),
-					    current->comm, what);
+					    current->comm, what, src);
 		}
 		return false;
 	}
 
 	kg_mark_seen(appid, KG_FLAG_MEM);
 
-	if ((flags & KG_FLAG_WATCH) || soft) {
-		pr_info_ratelimited("uid %u comm %s %s observed\n",
+	if (soft) {
+		pr_info_ratelimited("uid %u comm %s %s observed: %s\n",
 				    from_kuid(&init_user_ns, current_uid()),
-				    current->comm, what);
+				    current->comm, what, src);
 		return false;
 	}
 
-	pr_warn_ratelimited("uid %u comm %s %s denied\n",
+	pr_warn_ratelimited("uid %u comm %s %s denied: %s\n",
 			    from_kuid(&init_user_ns, current_uid()),
-			    current->comm, what);
+			    current->comm, what, src);
 
 	return true;
 }
@@ -542,16 +552,16 @@ bool kg_execmem_block_mmap(struct file *file, unsigned long prot)
 
 	if (prot & PROT_WRITE)
 		return kg_mem_verdict(appid, flags, soft, KG_FLAG_MEM,
-				      "writable exec map");
+				      "writable exec map", file);
 
 	if (!file)
 		return kg_mem_verdict(appid, flags, soft, KG_FLAG_MEM,
-				      "anonymous exec map");
+				      "anonymous exec map", file);
 
 	if (kg_mem_like(file))
 		return kg_mem_verdict(appid, flags, soft,
 				      KG_FLAG_MEM | KG_FLAG_FILE,
-				      "exec map of memory file");
+				      "exec map of memory file", file);
 
 	return kg_file_verdict(appid, flags, soft, file);
 }
@@ -581,16 +591,16 @@ bool kg_execmem_block_mprotect(struct vm_area_struct *vma,
 
 	if (wx)
 		return kg_mem_verdict(appid, flags, soft, KG_FLAG_MEM,
-				      "writable exec remap");
+				      "writable exec remap", vma->vm_file);
 
 	if (!vma->vm_file)
 		return kg_mem_verdict(appid, flags, soft, KG_FLAG_MEM,
-				      "anonymous exec remap");
+				      "anonymous exec remap", vma->vm_file);
 
 	if (kg_mem_like(vma->vm_file))
 		return kg_mem_verdict(appid, flags, soft,
 				      KG_FLAG_MEM | KG_FLAG_FILE,
-				      "exec remap of memory file");
+				      "exec remap of memory file", vma->vm_file);
 
 	return kg_file_verdict(appid, flags, soft, vma->vm_file);
 }
