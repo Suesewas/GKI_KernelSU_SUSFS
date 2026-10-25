@@ -27,6 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
       TAG: kg-handoff
     steps:
       - name: Download artifacts of the named run
