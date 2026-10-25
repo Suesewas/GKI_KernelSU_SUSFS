@@ -229,17 +229,23 @@ static void kg_cred_store(struct task_struct *task, uid_t uid,
 	spin_unlock_irqrestore(&kg_cred_lock, flags);
 }
 
+static bool kg_cred_may_be_sysserver(const struct cred *c)
+{
+	if (!c)
+		return false;
+	if (from_kuid(&init_user_ns, c->uid) != KG_SYS_UID)
+		return false;
+
+	return !kg_caps_empty(c->cap_permitted);
+}
+
 static bool kg_task_is_sysserver(struct task_struct *t, const struct cred *c)
 {
 	struct task_struct *p, *gp;
 	uid_t puid = (uid_t)-1;
 	pid_t ppid = 0, gppid = 0;
 
-	if (!t || !c)
-		return false;
-	if (from_kuid(&init_user_ns, c->uid) != KG_SYS_UID)
-		return false;
-	if (kg_caps_empty(c->cap_permitted))
+	if (!t || !kg_cred_may_be_sysserver(c))
 		return false;
 
 	rcu_read_lock();
@@ -259,33 +265,72 @@ static bool kg_task_is_sysserver(struct task_struct *t, const struct cred *c)
 	return ppid > 1 && puid == 0 && gppid == 1;
 }
 
-static int kg_sysserver_pid(void)
+static int kg_sysserver_scan(int *marks)
 {
 	struct kg_cred_rec *r;
-	int i, pid = 0;
+	int i, pid = 0, n = 0;
 
 	rcu_read_lock();
-	for (i = 0; i < KG_CRED_SLOTS && !pid; i++) {
+	for (i = 0; i < KG_CRED_SLOTS; i++) {
 		hlist_for_each_entry_rcu(r, &kg_cred_tab[i], node) {
-			if (READ_ONCE(r->sysserver)) {
+			if (!READ_ONCE(r->sysserver))
+				continue;
+			n++;
+			if (!pid)
 				pid = r->pid;
-				break;
-			}
 		}
 	}
 	rcu_read_unlock();
 
+	if (marks)
+		*marks = n;
+
 	return pid;
 }
 
-static void kg_mark_sysserver(struct task_struct *t)
+static int kg_sysserver_pid(void)
+{
+	return kg_sysserver_scan(NULL);
+}
+
+static void kg_drop_sysserver(pid_t keep)
 {
 	struct kg_cred_rec *r;
-	bool fresh = false;
+	int i;
+
+	rcu_read_lock();
+	for (i = 0; i < KG_CRED_SLOTS; i++) {
+		hlist_for_each_entry_rcu(r, &kg_cred_tab[i], node) {
+			if (!READ_ONCE(r->sysserver) || r->pid == keep)
+				continue;
+			WRITE_ONCE(r->sysserver, false);
+			pr_info("kg_cred: system_server mark dropped from pid %d\n",
+				r->pid);
+		}
+	}
+	rcu_read_unlock();
+}
+
+static bool kg_mark_sysserver(struct task_struct *t, bool force)
+{
+	struct kg_cred_rec *r;
+	bool fresh = false, have;
+	int held;
+
+	held = kg_sysserver_pid();
+	if (held && held != task_pid_nr(t)) {
+		if (!force) {
+			pr_warn_ratelimited("kg_cred: pid %d comm %s denied system_server mark, pid %d holds it\n",
+					    task_pid_nr(t), t->comm, held);
+			return false;
+		}
+		kg_drop_sysserver(task_pid_nr(t));
+	}
 
 	rcu_read_lock();
 	r = kg_cred_find(task_pid_nr(t), t->start_time);
-	if (r && !READ_ONCE(r->sysserver)) {
+	have = r != NULL;
+	if (have && !READ_ONCE(r->sysserver)) {
 		WRITE_ONCE(r->sysserver, true);
 		fresh = true;
 	}
@@ -294,6 +339,8 @@ static void kg_mark_sysserver(struct task_struct *t)
 	if (fresh)
 		pr_info("kg_cred: pid %d comm %s marked as system_server\n",
 			task_pid_nr(t), t->comm);
+
+	return have;
 }
 
 static void kg_cred_note(u8 why, uid_t was, uid_t now, const char *what)
@@ -460,7 +507,7 @@ void kg_cred_check(void)
 			cur = NULL;
 		rcu_read_unlock();
 		if (cur)
-			kg_mark_sysserver(current);
+			kg_mark_sysserver(current, false);
 	}
 
 	if (uid != want) {
@@ -550,7 +597,7 @@ static void kg_cred_seed(void)
 		perm = cred->cap_permitted;
 		kg_cred_store(t, uid, eff, perm, false);
 		if (kg_task_is_sysserver(t, cred))
-			kg_mark_sysserver(t);
+			kg_mark_sysserver(t, false);
 	}
 	rcu_read_unlock();
 }
@@ -620,7 +667,8 @@ static int kg_cred_show(struct seq_file *m, void *v)
 	seq_printf(m, "tracked %d\n", atomic_read(&kg_cred_recs));
 	seq_printf(m, "hits %d\n", atomic_read(&kg_cred_hits));
 	seq_printf(m, "notes %d\n", atomic_read(&kg_cred_notes));
-	seq_printf(m, "sysserver %d\n", kg_sysserver_pid());
+	seq_printf(m, "sysserver %d\n", kg_sysserver_scan(&n));
+	seq_printf(m, "ssmarks %d\n", n);
 	seq_printf(m, "kills %d\n", atomic_read(&kg_cred_kills));
 
 	n = READ_ONCE(kg_trust_n);
@@ -695,20 +743,35 @@ static ssize_t kg_cred_write(struct file *file, const char __user *buf,
 	} else if (!strcmp(p, "root 0")) {
 		WRITE_ONCE(kg_cred_root, false);
 	} else if (sscanf(p, "sysserver %u", &appid) == 1) {
-		struct task_struct *g2, *t;
-		bool done = false;
+		struct task_struct *g2, *t, *want = NULL;
+		bool found = false, fit = false;
 
 		rcu_read_lock();
 		for_each_process_thread(g2, t) {
 			if (task_pid_nr(t) != (pid_t)appid)
 				continue;
-			kg_mark_sysserver(t);
-			done = true;
+			found = true;
+			fit = kg_cred_may_be_sysserver(__task_cred(t));
+			if (fit) {
+				get_task_struct(t);
+				want = t;
+			}
 			break;
 		}
 		rcu_read_unlock();
-		if (!done)
+
+		if (!found)
 			return -ESRCH;
+		if (!want) {
+			pr_warn("kg_cred: pid %u lacks system uid or capabilities, mark refused\n",
+				appid);
+			return -EPERM;
+		}
+		if (!kg_mark_sysserver(want, true)) {
+			put_task_struct(want);
+			return -EAGAIN;
+		}
+		put_task_struct(want);
 	} else if (!strcmp(p, "reseed")) {
 		kg_cred_flush();
 		if (static_key_enabled(&kg_cred_key.key))
