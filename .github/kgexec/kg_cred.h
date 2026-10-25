@@ -18,5 +18,6 @@ bool kg_cred_block_module(void);
 bool kg_cred_block_exec(struct file *file);
 bool kg_cred_active(void);
 bool kg_cred_is_system_server(void);
+u32 kg_cred_base_appid(void);
 
 #endif

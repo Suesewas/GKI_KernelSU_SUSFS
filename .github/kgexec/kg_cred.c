@@ -13,6 +13,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/proc_fs.h>
 #include <linux/rculist.h>
 #include <linux/sched.h>
@@ -43,6 +44,7 @@
 #define KG_WHY_MODULE	4
 #define KG_WHY_EXEC	5
 #define KG_WHY_SUBJ	6
+#define KG_WHY_POSE	7
 
 #define KG_BASE_SET	0
 #define KG_BASE_KEEP	1
@@ -69,6 +71,7 @@ struct kg_cred_rec {
 	pid_t pid;
 	u64 start;
 	uid_t base;
+	kernel_cap_t bperm;
 	struct kg_ids ids;
 };
 
@@ -91,8 +94,15 @@ static u8 kg_exec_mode;
 static char kg_cred_last[KG_LAST_MAX];
 static DEFINE_SPINLOCK(kg_cred_last_lock);
 
-static u32 kg_trust[KG_TRUST_MAX];
-static int kg_trust_n;
+struct kg_trust_set {
+	struct rcu_head rcu;
+	int n;
+	u32 id[KG_TRUST_MAX];
+};
+
+static struct kg_trust_set __rcu *kg_trust_live;
+static struct kg_trust_set *kg_trust_pending;
+static DEFINE_MUTEX(kg_trust_mutex);
 
 static const char * const kg_exec_dirs[] = {
 	"/system/",
@@ -176,17 +186,23 @@ static inline u32 kg_cred_slot(pid_t pid)
 
 static bool kg_trusted(u32 appid)
 {
-	int i, n = READ_ONCE(kg_trust_n);
+	struct kg_trust_set *s;
+	bool ok = false;
+	int i;
 
-	if (n > KG_TRUST_MAX)
-		n = KG_TRUST_MAX;
-
-	for (i = 0; i < n; i++) {
-		if (READ_ONCE(kg_trust[i]) == appid)
-			return true;
+	rcu_read_lock();
+	s = rcu_dereference(kg_trust_live);
+	if (s) {
+		for (i = 0; i < s->n; i++) {
+			if (s->id[i] == appid) {
+				ok = true;
+				break;
+			}
+		}
 	}
+	rcu_read_unlock();
 
-	return false;
+	return ok;
 }
 
 static struct kg_cred_rec *kg_cred_find(pid_t pid, u64 start)
@@ -262,11 +278,14 @@ static void kg_cred_store(struct task_struct *task, const struct kg_ids *ids,
 	r = kg_cred_find(pid, start);
 	if (r) {
 		r->ids = *ids;
-		if (base_mode == KG_BASE_SET)
+		if (base_mode == KG_BASE_SET) {
+			r->bperm = ids->perm;
 			WRITE_ONCE(r->base, ids->uid);
-		else if (base_mode == KG_BASE_ADOPT &&
-			 READ_ONCE(r->base) == 0 && ids->uid != 0)
+		} else if (base_mode == KG_BASE_ADOPT &&
+			   READ_ONCE(r->base) == 0 && ids->uid != 0) {
+			r->bperm = ids->perm;
 			WRITE_ONCE(r->base, ids->uid);
+		}
 		rcu_read_unlock();
 		spin_unlock_irqrestore(&kg_cred_lock, flags);
 		return;
@@ -295,6 +314,7 @@ static void kg_cred_store(struct task_struct *task, const struct kg_ids *ids,
 	fresh->pid = pid;
 	fresh->start = start;
 	fresh->base = ids->uid;
+	fresh->bperm = ids->perm;
 	fresh->ids = *ids;
 	hlist_add_head_rcu(&fresh->node, &kg_cred_tab[kg_cred_slot(pid)]);
 	atomic_inc(&kg_cred_recs);
@@ -398,7 +418,7 @@ static void kg_sysserver_gone(struct task_struct *task)
 static void kg_cred_note(u8 why, uid_t was, uid_t now, const char *what)
 {
 	static const char * const names[] = {
-		"", "uid", "caps", "root", "module", "exec", "subj",
+		"", "uid", "caps", "root", "module", "exec", "subj", "pose",
 	};
 	unsigned long flags;
 
@@ -456,8 +476,10 @@ void kg_cred_commit(struct task_struct *task, const struct cred *new)
 {
 	struct kg_cred_rec *r;
 	struct kg_ids ids;
-	uid_t newuid, base;
-	bool root_now;
+	kernel_cap_t bperm;
+	uid_t newuid, euid, fsuid, base, bapp, napp;
+	bool root_now, down, capgain;
+	u8 why = 0;
 	u8 mode = READ_ONCE(kg_root_mode);
 
 	if (!static_branch_unlikely(&kg_cred_key) || !task || !new)
@@ -467,23 +489,51 @@ void kg_cred_commit(struct task_struct *task, const struct cred *new)
 
 	rcu_read_lock();
 	r = kg_cred_find(task_pid_nr(task), task->start_time);
-	if (r)
+	if (r) {
 		base = READ_ONCE(r->base);
-	else
-		base = from_kuid(&init_user_ns, __task_cred(task)->uid);
+		bperm = r->bperm;
+	} else {
+		const struct cred *old = __task_cred(task);
+
+		base = from_kuid(&init_user_ns, old->uid);
+		bperm = old->cap_permitted;
+	}
 	rcu_read_unlock();
 
-	root_now = newuid == 0 ||
-		   from_kuid(&init_user_ns, new->euid) == 0 ||
-		   from_kuid(&init_user_ns, new->fsuid) == 0;
+	euid = from_kuid(&init_user_ns, new->euid);
+	fsuid = from_kuid(&init_user_ns, new->fsuid);
 
-	if (mode && root_now && base != 0 &&
-	    !kg_trusted(base % KG_USER_OFF)) {
-		pr_warn_ratelimited("kg_cred: pid %d comm %s uid %u asked for root\n",
-				    task_pid_nr(task), task->comm, base);
-		kg_cred_react(KG_WHY_ROOT, base, 0, NULL,
-			      mode >= 2 && READ_ONCE(kg_cred_enforce) &&
-			      task == current);
+	root_now = newuid == 0 || euid == 0 || fsuid == 0;
+
+	bapp = base % KG_USER_OFF;
+	napp = newuid % KG_USER_OFF;
+	if (euid % KG_USER_OFF < napp)
+		napp = euid % KG_USER_OFF;
+	if (fsuid % KG_USER_OFF < napp)
+		napp = fsuid % KG_USER_OFF;
+	down = napp < bapp;
+	capgain = !cap_issubset(new->cap_permitted, bperm);
+
+	if (root_now)
+		why = KG_WHY_ROOT;
+	else if (bapp >= KG_APP_MIN && (down || capgain))
+		why = KG_WHY_POSE;
+	else if (bapp < KG_APP_MIN && down && capgain)
+		why = KG_WHY_POSE;
+
+	if (mode && why && base != 0 && !kg_trusted(bapp)) {
+		bool kill = mode >= 2 && READ_ONCE(kg_cred_enforce) &&
+			    task == current;
+
+		if (why == KG_WHY_ROOT)
+			pr_warn_ratelimited("kg_cred: pid %d comm %s uid %u asked for root\n",
+					    task_pid_nr(task), task->comm, base);
+		else
+			pr_warn_ratelimited("kg_cred: pid %d comm %s uid %u posed as uid %u\n",
+					    task_pid_nr(task), task->comm, base,
+					    napp);
+		kg_cred_react(why, base, why == KG_WHY_ROOT ? 0 : napp, NULL,
+			      kill);
 	}
 
 	kg_ids_of(&ids, new);
@@ -493,6 +543,23 @@ void kg_cred_commit(struct task_struct *task, const struct cred *new)
 bool kg_cred_active(void)
 {
 	return static_branch_unlikely(&kg_cred_key) ? true : false;
+}
+
+u32 kg_cred_base_appid(void)
+{
+	struct kg_cred_rec *r;
+	u32 base = 0;
+
+	if (!static_branch_unlikely(&kg_cred_key))
+		return 0;
+
+	rcu_read_lock();
+	r = kg_cred_find(task_pid_nr(current), current->start_time);
+	if (r)
+		base = READ_ONCE(r->base) % KG_USER_OFF;
+	rcu_read_unlock();
+
+	return base;
 }
 
 bool kg_cred_is_system_server(void)
@@ -759,45 +826,116 @@ static void kg_cred_flush(void)
 	spin_unlock_irqrestore(&kg_cred_lock, flags);
 }
 
+static struct kg_trust_set *kg_trust_copy(void)
+{
+	struct kg_trust_set *s, *old;
+
+	s = kzalloc(sizeof(*s), GFP_KERNEL);
+	if (!s)
+		return NULL;
+
+	rcu_read_lock();
+	old = rcu_dereference(kg_trust_live);
+	if (old) {
+		s->n = old->n;
+		memcpy(s->id, old->id, sizeof(s->id));
+	}
+	rcu_read_unlock();
+
+	return s;
+}
+
+static void kg_trust_publish(struct kg_trust_set *s)
+{
+	struct kg_trust_set *old;
+
+	old = rcu_replace_pointer(kg_trust_live, s, true);
+	if (old)
+		kfree_rcu(old, rcu);
+}
+
+static int kg_trust_begin(void)
+{
+	struct kg_trust_set *s;
+
+	s = kzalloc(sizeof(*s), GFP_KERNEL);
+	if (!s)
+		return -ENOMEM;
+
+	kfree(kg_trust_pending);
+	kg_trust_pending = s;
+
+	return 0;
+}
+
+static int kg_trust_commit(void)
+{
+	struct kg_trust_set *s = kg_trust_pending;
+
+	if (!s)
+		return -EINVAL;
+
+	kg_trust_pending = NULL;
+	kg_trust_publish(s);
+
+	return 0;
+}
+
 static int kg_trust_add(u32 appid)
 {
-	unsigned long flags;
-	int n;
+	struct kg_trust_set *s;
+	int i;
 
 	if (appid < KG_SYS_UID || appid > 99999)
 		return -ERANGE;
 
-	spin_lock_irqsave(&kg_cred_lock, flags);
-	n = kg_trust_n;
-	if (n >= KG_TRUST_MAX) {
-		spin_unlock_irqrestore(&kg_cred_lock, flags);
+	if (kg_trust_pending) {
+		s = kg_trust_pending;
+		for (i = 0; i < s->n; i++) {
+			if (s->id[i] == appid)
+				return 0;
+		}
+		if (s->n >= KG_TRUST_MAX)
+			return -ENOSPC;
+		s->id[s->n++] = appid;
+		return 0;
+	}
+
+	if (kg_trusted(appid))
+		return 0;
+
+	s = kg_trust_copy();
+	if (!s)
+		return -ENOMEM;
+	if (s->n >= KG_TRUST_MAX) {
+		kfree(s);
 		return -ENOSPC;
 	}
-	if (!kg_trusted(appid)) {
-		kg_trust[n] = appid;
-		smp_store_release(&kg_trust_n, n + 1);
-	}
-	spin_unlock_irqrestore(&kg_cred_lock, flags);
+	s->id[s->n++] = appid;
+	kg_trust_publish(s);
 
 	return 0;
 }
 
 static void kg_trust_clear(void)
 {
-	unsigned long flags;
+	struct kg_trust_set *s;
 
-	spin_lock_irqsave(&kg_cred_lock, flags);
-	WRITE_ONCE(kg_trust_n, 0);
-	memset(kg_trust, 0, sizeof(kg_trust));
-	spin_unlock_irqrestore(&kg_cred_lock, flags);
+	kfree(kg_trust_pending);
+	kg_trust_pending = NULL;
+
+	s = kzalloc(sizeof(*s), GFP_KERNEL);
+	if (s)
+		kg_trust_publish(s);
 }
 
 static int kg_cred_show(struct seq_file *m, void *v)
 {
+	struct kg_trust_set *ts;
 	unsigned long flags;
 	int i, n;
 
-	seq_puts(m, "abi 4\n");
+	seq_puts(m, "abi 5\n");
 	seq_printf(m, "on %d\n",
 		   static_key_enabled(&kg_cred_key.key) ? 1 : 0);
 	seq_printf(m, "enforce %d\n", READ_ONCE(kg_cred_enforce) ? 1 : 0);
@@ -814,12 +952,13 @@ static int kg_cred_show(struct seq_file *m, void *v)
 	seq_printf(m, "ssmarks %d\n", kg_sysserver_pid() ? 1 : 0);
 	seq_printf(m, "kills %d\n", atomic_read(&kg_cred_kills));
 
-	n = READ_ONCE(kg_trust_n);
-	if (n > KG_TRUST_MAX)
-		n = KG_TRUST_MAX;
+	rcu_read_lock();
+	ts = rcu_dereference(kg_trust_live);
+	n = ts ? ts->n : 0;
 	seq_printf(m, "trusted %d\n", n);
 	for (i = 0; i < n; i++)
-		seq_printf(m, "trust %u\n", READ_ONCE(kg_trust[i]));
+		seq_printf(m, "trust %u\n", ts->id[i]);
+	rcu_read_unlock();
 
 
 	spin_lock_irqsave(&kg_cred_last_lock, flags);
@@ -944,13 +1083,37 @@ looked:
 	} else if (!strcmp(p, "trust clear")) {
 		if (READ_ONCE(kg_cred_sealed))
 			return -EPERM;
+		mutex_lock(&kg_trust_mutex);
 		kg_trust_clear();
+		mutex_unlock(&kg_trust_mutex);
+	} else if (!strcmp(p, "trust begin")) {
+		int ret;
+
+		if (READ_ONCE(kg_cred_sealed))
+			return -EPERM;
+		mutex_lock(&kg_trust_mutex);
+		ret = kg_trust_begin();
+		mutex_unlock(&kg_trust_mutex);
+		if (ret)
+			return ret;
+	} else if (!strcmp(p, "trust commit")) {
+		int ret;
+
+		if (READ_ONCE(kg_cred_sealed))
+			return -EPERM;
+		mutex_lock(&kg_trust_mutex);
+		ret = kg_trust_commit();
+		mutex_unlock(&kg_trust_mutex);
+		if (ret)
+			return ret;
 	} else if (sscanf(p, "trust %u%n", &appid, &pn) == 1 && !p[pn]) {
 		int ret;
 
 		if (READ_ONCE(kg_cred_sealed))
 			return -EPERM;
+		mutex_lock(&kg_trust_mutex);
 		ret = kg_trust_add(appid);
+		mutex_unlock(&kg_trust_mutex);
 		if (ret)
 			return ret;
 	} else if (sscanf(p, "module %15s%n", arg, &pn) == 1 && !p[pn]) {

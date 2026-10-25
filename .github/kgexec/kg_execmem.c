@@ -155,8 +155,13 @@ static u8 kg_flags_now(u32 *out_appid, bool *soft)
 	int i;
 
 	appid = from_kuid(&init_user_ns, current_uid()) % KG_USER_OFF;
-	if (appid < KG_APP_MIN)
-		return kg_sys_now(appid);
+	if (appid < KG_APP_MIN) {
+		u32 base = kg_cred_base_appid();
+
+		if (base < KG_APP_MIN)
+			return kg_sys_now(appid);
+		appid = base;
+	}
 	if (appid > KG_APP_MAX) {
 		if (appid >= KG_SDK_MIN && appid <= KG_SDK_MAX) {
 			appid -= KG_SDK_OFF;
