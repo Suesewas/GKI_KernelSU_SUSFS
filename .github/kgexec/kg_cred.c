@@ -559,6 +559,9 @@ u32 kg_cred_base_appid(void)
 		base = READ_ONCE(r->base) % KG_USER_OFF;
 	rcu_read_unlock();
 
+	if (kg_trusted(base))
+		return 0;
+
 	return base;
 }
 

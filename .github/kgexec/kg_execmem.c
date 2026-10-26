@@ -284,6 +284,14 @@ static bool kg_path_deleted(const char *p)
 	return n > t && strcmp(p + n - t, tail) == 0;
 }
 
+static bool kg_own_oat(const char *p)
+{
+	if (strncmp(p, "/data/data/", 11) && strncmp(p, "/data/user/", 11))
+		return false;
+
+	return strstr(p, "/cache/oat/") != NULL;
+}
+
 static bool kg_in_allow(const char *p)
 {
 	size_t i;
@@ -319,9 +327,9 @@ static bool kg_path_ok(struct file *file, u8 flags)
 	ok = kg_in_allow(p);
 
 	if (!ok)
-		pr_warn_ratelimited("uid %u comm %s exec map denied: %s\n",
+		pr_warn_ratelimited("uid %u base %u comm %s exec map denied: %s\n",
 				    from_kuid(&init_user_ns, current_uid()),
-				    current->comm, p);
+				    kg_cred_base_appid(), current->comm, p);
 
 	free_page((unsigned long)buf);
 	return ok;
@@ -450,7 +458,7 @@ bool kg_dex_block_open(struct file *file)
 		return false;
 
 	p = d_path(&file->f_path, buf, PAGE_SIZE);
-	if (IS_ERR(p) || kg_in_allow(p)) {
+	if (IS_ERR(p) || kg_in_allow(p) || kg_own_oat(p)) {
 		free_page((unsigned long)buf);
 		return false;
 	}
