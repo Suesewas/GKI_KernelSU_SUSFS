@@ -74,7 +74,7 @@ on:
       use_bbg:
         description: "Baseband Guard"
         type: boolean
-        default: true
+        default: false
       use_net:
         description: "Networking"
         type: boolean
@@ -1472,7 +1472,7 @@ jobs:
           if env("USE_PERF","false")=="true": feats.append("Performance Tuning")
           if env("USE_KGEXEC","true")=="true": feats.append("kGuard Execmem")
           lines=[]
-          lines.append("# Wild Kernels for GKI2 Devices")
+          lines.append("# Kernels for GKI2 Devices")
           lines.append("")
           lines.append("## Root")
           lines.append("")
