@@ -26,6 +26,9 @@
 #define KG_PROP_ABI	2
 #define KG_PROP_MAX	192
 #define KG_PROP_LEN	128
+#define KG_PROP_W	127
+#define KG__STR(x)	#x
+#define KG__XSTR(x)	KG__STR(x)
 #define KG_APP_MIN	10000
 #define KG_APP_MAX	19999
 #define KG_USER_OFF	100000
@@ -380,7 +383,10 @@ static ssize_t kg_prop_proc_write(struct file *file, const char __user *ubuf,
 		return -EFAULT;
 	cmd[len] = '\0';
 
-	got = sscanf(cmd, "%15s %u %191s %191s", verb, &key, target, redirect);
+	BUILD_BUG_ON(KG_PROP_W + 1 != KG_PROP_LEN);
+
+	got = sscanf(cmd, "%15s %u %" KG__XSTR(KG_PROP_W) "s %" KG__XSTR(KG_PROP_W) "s",
+		     verb, &key, target, redirect);
 	if (got < 1)
 		return -EINVAL;
 
