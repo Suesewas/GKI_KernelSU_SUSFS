@@ -624,6 +624,32 @@ jobs:
           fi
         } > "$SUMMARY_FILE"
 
+    - name: Pack Boot Image
+      id: bootimg
+      shell: bash
+      run: |
+        set -euo pipefail
+        IMG="${{ github.workspace }}/AnyKernel3/Image"
+        if [ ! -f "$IMG" ]; then
+          echo "no Image, skipping boot.img"
+          exit 0
+        fi
+        OUT="${{ github.workspace }}/boot-out"
+        mkdir -p "$OUT"
+        python3 "${{ github.workspace }}/.github/scripts/pack_boot.py" \
+          "$IMG" "$OUT/boot.img"
+        ls -l "$OUT/boot.img"
+        echo "made=1" >> "$GITHUB_OUTPUT"
+
+    - name: Upload Boot Image
+      if: steps.bootimg.outputs.made == '1'
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ steps.extract.outputs.file_name }}-boot.img
+        path: ${{ github.workspace }}/boot-out/boot.img
+        if-no-files-found: ignore
+        compression-level: 0
+
     - name: Upload Artifacts
       id: kernel-artifact
       uses: actions/upload-artifact@v7
