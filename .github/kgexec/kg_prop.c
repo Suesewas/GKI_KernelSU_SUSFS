@@ -23,17 +23,24 @@
 
 #include <linux/kg_prop.h>
 
-#define KG_PROP_ABI	1
-#define KG_PROP_MAX	64
-#define KG_PROP_LEN	192
+#define KG_PROP_ABI	2
+#define KG_PROP_MAX	192
+#define KG_PROP_LEN	128
 #define KG_APP_MIN	10000
 #define KG_APP_MAX	19999
 #define KG_USER_OFF	100000
+#define KG_USER_MAX	999
 #define KG_CMD_MAX	512
 #define KG_OUT_MAX	8192
 
+/*
+ * key holds either a full uid (userid * KG_USER_OFF + appid), which matches
+ * that one app in that one android user, or a bare appid (KG_APP_MIN..
+ * KG_APP_MAX), which matches that app in every user. ABI 1 only ever wrote
+ * bare appids, so ABI 1 commands keep their old meaning.
+ */
 struct kg_prop_entry {
-	u32 appid;
+	u32 key;
 	u32 tlen;
 	char target[KG_PROP_LEN];
 	char redirect[KG_PROP_LEN];
@@ -58,7 +65,7 @@ struct filename *kg_prop_redirect(struct filename *name)
 	char buf[KG_PROP_LEN];
 	const char *p;
 	bool found = false;
-	u32 appid;
+	u32 uid, appid;
 	size_t len;
 	int i;
 
@@ -69,7 +76,8 @@ struct filename *kg_prop_redirect(struct filename *name)
 	if (!p || p[0] != '/')
 		return NULL;
 
-	appid = from_kuid(&init_user_ns, current_uid()) % KG_USER_OFF;
+	uid = from_kuid(&init_user_ns, current_uid());
+	appid = uid % KG_USER_OFF;
 	if (appid < KG_APP_MIN || appid > KG_APP_MAX)
 		return NULL;
 
@@ -80,16 +88,34 @@ struct filename *kg_prop_redirect(struct filename *name)
 	rcu_read_lock();
 	t = rcu_dereference(kg_prop_map);
 	if (t) {
+		int exact = -1, wild = -1;
+
 		for (i = 0; i < t->count; i++) {
-			if (t->e[i].appid != appid)
-				continue;
+			bool is_exact, is_wild;
+
 			if (t->e[i].tlen != (u32)len)
+				continue;
+			is_exact = t->e[i].key == uid;
+			is_wild = t->e[i].key == appid;
+			if (!is_exact && !is_wild)
 				continue;
 			if (memcmp(t->e[i].target, p, len) != 0)
 				continue;
+			if (is_exact) {
+				exact = i;
+				break;
+			}
+			if (wild < 0)
+				wild = i;
+		}
+
+		/* a per-user key always wins over an all-users appid key,
+		 * whatever order they were added in
+		 */
+		i = exact >= 0 ? exact : wild;
+		if (i >= 0) {
 			memcpy(buf, t->e[i].redirect, KG_PROP_LEN);
 			found = true;
-			break;
 		}
 	}
 	rcu_read_unlock();
@@ -103,8 +129,7 @@ struct filename *kg_prop_redirect(struct filename *name)
 		return NULL;
 
 	pr_info_ratelimited("uid %u comm %s redirect %s -> %s\n",
-			    from_kuid(&init_user_ns, current_uid()),
-			    current->comm, p, buf);
+			    uid, current->comm, p, buf);
 
 	return out;
 }
@@ -162,13 +187,25 @@ static bool kg_prop_path_ok(const char *p)
 	return true;
 }
 
-static int kg_prop_add(u32 appid, const char *target, const char *redirect)
+static bool kg_prop_key_ok(u32 key)
+{
+	u32 appid = key % KG_USER_OFF;
+
+	if (appid < KG_APP_MIN || appid > KG_APP_MAX)
+		return false;
+	if (key / KG_USER_OFF > KG_USER_MAX)
+		return false;
+
+	return true;
+}
+
+static int kg_prop_add(u32 key, const char *target, const char *redirect)
 {
 	struct kg_prop_table *old, *t;
 	size_t tlen;
 	int i;
 
-	if (appid < KG_APP_MIN || appid > KG_APP_MAX)
+	if (!kg_prop_key_ok(key))
 		return -ERANGE;
 	if (!kg_prop_path_ok(target) || !kg_prop_path_ok(redirect))
 		return -EINVAL;
@@ -190,7 +227,7 @@ static int kg_prop_add(u32 appid, const char *target, const char *redirect)
 	}
 
 	for (i = 0; i < t->count; i++) {
-		if (t->e[i].appid != appid)
+		if (t->e[i].key != key)
 			continue;
 		if (strncmp(t->e[i].target, target, KG_PROP_LEN) != 0)
 			continue;
@@ -206,7 +243,7 @@ static int kg_prop_add(u32 appid, const char *target, const char *redirect)
 		return -ENOSPC;
 	}
 
-	t->e[t->count].appid = appid;
+	t->e[t->count].key = key;
 	t->e[t->count].tlen = (u32)tlen;
 	strscpy(t->e[t->count].target, target, KG_PROP_LEN);
 	strscpy(t->e[t->count].redirect, redirect, KG_PROP_LEN);
@@ -217,7 +254,7 @@ static int kg_prop_add(u32 appid, const char *target, const char *redirect)
 	return 0;
 }
 
-static int kg_prop_del(u32 appid)
+static int kg_prop_del(u32 key)
 {
 	struct kg_prop_table *old, *t;
 	int i, j;
@@ -242,7 +279,7 @@ static int kg_prop_del(u32 appid)
 	}
 
 	for (i = 0, j = 0; i < old->count; i++) {
-		if (old->e[i].appid == appid)
+		if (old->e[i].key == key)
 			continue;
 		t->e[j] = old->e[i];
 		j++;
@@ -314,7 +351,7 @@ static ssize_t kg_prop_proc_read(struct file *file, char __user *ubuf,
 	if (t) {
 		for (i = 0; i < t->count && n < KG_OUT_MAX - 2 * KG_PROP_LEN; i++)
 			n += scnprintf(out + n, KG_OUT_MAX - n, "%u %s %s\n",
-				       t->e[i].appid, t->e[i].target,
+				       t->e[i].key, t->e[i].target,
 				       t->e[i].redirect);
 	}
 	mutex_unlock(&kg_prop_lock);
@@ -332,7 +369,7 @@ static ssize_t kg_prop_proc_write(struct file *file, const char __user *ubuf,
 	char verb[16];
 	char target[KG_PROP_LEN];
 	char redirect[KG_PROP_LEN];
-	unsigned int appid = 0;
+	unsigned int key = 0;
 	int got, ret;
 
 	if (!capable(CAP_SYS_ADMIN))
@@ -343,14 +380,14 @@ static ssize_t kg_prop_proc_write(struct file *file, const char __user *ubuf,
 		return -EFAULT;
 	cmd[len] = '\0';
 
-	got = sscanf(cmd, "%15s %u %191s %191s", verb, &appid, target, redirect);
+	got = sscanf(cmd, "%15s %u %191s %191s", verb, &key, target, redirect);
 	if (got < 1)
 		return -EINVAL;
 
 	if (strcmp(verb, "add") == 0 && got >= 4)
-		ret = kg_prop_add(appid, target, redirect);
+		ret = kg_prop_add(key, target, redirect);
 	else if (strcmp(verb, "del") == 0 && got >= 2)
-		ret = kg_prop_del(appid);
+		ret = kg_prop_del(key);
 	else if (strcmp(verb, "clear") == 0)
 		ret = kg_prop_clear();
 	else if (strcmp(verb, "seal") == 0)
