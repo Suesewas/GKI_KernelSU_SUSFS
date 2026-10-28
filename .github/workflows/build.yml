@@ -636,8 +636,15 @@ jobs:
         fi
         OUT="${{ github.workspace }}/boot-out"
         mkdir -p "$OUT"
+        MAGIC=$(head -c 4 "$IMG" | od -An -tx1 | tr -d ' \n')
+        if [ "$MAGIC" = "02214c18" ]; then
+          cp "$IMG" "$OUT/Image.lz4"
+        else
+          command -v lz4 >/dev/null || sudo apt-get install -y -qq lz4
+          lz4 -l -12 -f "$IMG" "$OUT/Image.lz4"
+        fi
         python3 "${{ github.workspace }}/.github/scripts/pack_boot.py" \
-          "$IMG" "$OUT/boot.img"
+          "$OUT/Image.lz4" "$OUT/boot.img"
         ls -l "$OUT/boot.img"
         echo "made=1" >> "$GITHUB_OUTPUT"
 
