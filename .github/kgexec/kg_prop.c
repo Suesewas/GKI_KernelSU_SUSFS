@@ -41,6 +41,11 @@
  * that one app in that one android user, or a bare appid (KG_APP_MIN..
  * KG_APP_MAX), which matches that app in every user. ABI 1 only ever wrote
  * bare appids, so ABI 1 commands keep their old meaning.
+ *
+ * A target ending in '/' matches by prefix: every path below it is rewritten
+ * under redirect, which then has to end in '/' as well. The property area is
+ * not a single file, so one such entry covers it instead of one entry per
+ * context file.
  */
 struct kg_prop_entry {
 	u32 key;
@@ -60,6 +65,11 @@ DEFINE_STATIC_KEY_FALSE(kg_prop_key);
 static struct kg_prop_table __rcu *kg_prop_map;
 static DEFINE_MUTEX(kg_prop_lock);
 static bool kg_prop_sealed;
+
+static bool kg_prop_is_dir(const struct kg_prop_entry *e)
+{
+	return e->tlen > 0 && e->target[e->tlen - 1] == '/';
+}
 
 struct filename *kg_prop_redirect(struct filename *name)
 {
@@ -94,16 +104,24 @@ struct filename *kg_prop_redirect(struct filename *name)
 		int exact = -1, wild = -1;
 
 		for (i = 0; i < t->count; i++) {
+			const struct kg_prop_entry *e = &t->e[i];
 			bool is_exact, is_wild;
 
-			if (t->e[i].tlen != (u32)len)
-				continue;
-			is_exact = t->e[i].key == uid;
-			is_wild = t->e[i].key == appid;
+			is_exact = e->key == uid;
+			is_wild = e->key == appid;
 			if (!is_exact && !is_wild)
 				continue;
-			if (memcmp(t->e[i].target, p, len) != 0)
-				continue;
+			if (kg_prop_is_dir(e)) {
+				if (len <= e->tlen)
+					continue;
+				if (memcmp(e->target, p, e->tlen) != 0)
+					continue;
+			} else {
+				if (e->tlen != (u32)len)
+					continue;
+				if (memcmp(e->target, p, len) != 0)
+					continue;
+			}
 			if (is_exact) {
 				exact = i;
 				break;
@@ -117,8 +135,22 @@ struct filename *kg_prop_redirect(struct filename *name)
 		 */
 		i = exact >= 0 ? exact : wild;
 		if (i >= 0) {
-			memcpy(buf, t->e[i].redirect, KG_PROP_LEN);
-			found = true;
+			const struct kg_prop_entry *e = &t->e[i];
+
+			if (kg_prop_is_dir(e)) {
+				size_t rlen = strnlen(e->redirect, KG_PROP_LEN);
+				size_t tail = len - e->tlen;
+
+				if (rlen > 0 && rlen + tail < KG_PROP_LEN) {
+					memcpy(buf, e->redirect, rlen);
+					memcpy(buf + rlen, p + e->tlen, tail);
+					buf[rlen + tail] = '\0';
+					found = true;
+				}
+			} else {
+				memcpy(buf, e->redirect, KG_PROP_LEN);
+				found = true;
+			}
 		}
 	}
 	rcu_read_unlock();
@@ -214,6 +246,13 @@ static int kg_prop_add(u32 key, const char *target, const char *redirect)
 		return -EINVAL;
 
 	tlen = strnlen(target, KG_PROP_LEN);
+
+	/* a directory target and its replacement have to agree on the trailing
+	 * slash, so the tail of a matched path can simply be appended
+	 */
+	if ((target[tlen - 1] == '/') !=
+	    (redirect[strnlen(redirect, KG_PROP_LEN) - 1] == '/'))
+		return -EINVAL;
 
 	mutex_lock(&kg_prop_lock);
 	if (kg_prop_sealed) {
