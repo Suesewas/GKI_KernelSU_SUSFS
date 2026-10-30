@@ -4,6 +4,7 @@
 
 #include <linux/capability.h>
 #include <linux/cred.h>
+#include <linux/dcache.h>
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
@@ -11,13 +12,18 @@
 #include <linux/init.h>
 #include <linux/jump_label.h>
 #include <linux/kernel.h>
+#include <linux/mm.h>
+#include <linux/mman.h>
 #include <linux/mutex.h>
+#include <linux/namei.h>
 #include <linux/printk.h>
 #include <linux/proc_fs.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/task_work.h>
 #include <linux/uaccess.h>
 #include <linux/uidgid.h>
 
@@ -33,6 +39,9 @@
 #define KG_APP_MAX	19999
 #define KG_USER_OFF	100000
 #define KG_USER_MAX	999
+#define KG_PROP_AREA	"/dev/__properties__/"
+#define KG_REMAP_MAX	64
+#define KG_PATH_MAX	256
 #define KG_CMD_MAX	512
 #define KG_OUT_MAX	8192
 
@@ -441,6 +450,202 @@ static ssize_t kg_prop_proc_write(struct file *file, const char __user *ubuf,
 		ret = -EINVAL;
 
 	return ret ? ret : (ssize_t)len;
+}
+
+struct kg_prop_spot {
+	unsigned long addr;
+	unsigned long len;
+	char redirect[KG_PROP_LEN];
+};
+
+/*
+ * A redirect only covers what is opened after the uid is in place. An app
+ * never opens the property area at all: it inherits zygote's mapping, made
+ * while the uid was still 0, so native reads inside the process keep seeing
+ * the real values. Once the process becomes an app we therefore map the
+ * replacement over the inherited mapping, at the same address and length,
+ * so the pointers bionic already holds into the area stay valid.
+ */
+static bool kg_prop_wanted(u32 uid, u32 appid)
+{
+	struct kg_prop_table *t;
+	bool hit = false;
+	int i;
+
+	rcu_read_lock();
+	t = rcu_dereference(kg_prop_map);
+	if (t) {
+		for (i = 0; i < t->count; i++) {
+			if (t->e[i].key != uid && t->e[i].key != appid)
+				continue;
+			if (strncmp(t->e[i].target, KG_PROP_AREA,
+				    sizeof(KG_PROP_AREA) - 1) != 0)
+				continue;
+			hit = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	return hit;
+}
+
+static bool kg_prop_lookup(u32 uid, u32 appid, const char *path,
+			   char *out, size_t outlen)
+{
+	struct kg_prop_table *t;
+	size_t len = strnlen(path, KG_PROP_LEN);
+	int exact = -1, wild = -1, i;
+	bool found = false;
+
+	if (len == 0 || len >= KG_PROP_LEN)
+		return false;
+
+	rcu_read_lock();
+	t = rcu_dereference(kg_prop_map);
+	if (t) {
+		for (i = 0; i < t->count; i++) {
+			bool is_exact, is_wild;
+
+			if (t->e[i].tlen != (u32)len)
+				continue;
+			is_exact = t->e[i].key == uid;
+			is_wild = t->e[i].key == appid;
+			if (!is_exact && !is_wild)
+				continue;
+			if (memcmp(t->e[i].target, path, len) != 0)
+				continue;
+			if (is_exact) {
+				exact = i;
+				break;
+			}
+			if (wild < 0)
+				wild = i;
+		}
+		i = exact >= 0 ? exact : wild;
+		if (i >= 0) {
+			strscpy(out, t->e[i].redirect, outlen);
+			found = true;
+		}
+	}
+	rcu_read_unlock();
+
+	return found;
+}
+
+static void kg_prop_remap_now(void)
+{
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	struct kg_prop_spot *spot;
+	char *buf;
+	u32 uid, appid;
+	int n = 0, i;
+
+	if (!mm)
+		return;
+
+	uid = from_kuid(&init_user_ns, current_uid());
+	appid = uid % KG_USER_OFF;
+	if (appid < KG_APP_MIN || appid > KG_APP_MAX)
+		return;
+
+	buf = kmalloc(KG_PATH_MAX, GFP_KERNEL);
+	spot = kcalloc(KG_REMAP_MAX, sizeof(*spot), GFP_KERNEL);
+	if (!buf || !spot)
+		goto out;
+
+	if (mmap_read_lock_killable(mm))
+		goto out;
+	{
+		VMA_ITERATOR(vmi, mm, 0);
+
+		for_each_vma(vmi, vma) {
+			const char *p;
+
+			if (n == KG_REMAP_MAX)
+				break;
+			if (!vma->vm_file)
+				continue;
+			p = d_path(&vma->vm_file->f_path, buf, KG_PATH_MAX);
+			if (IS_ERR(p))
+				continue;
+			if (strncmp(p, KG_PROP_AREA,
+				    sizeof(KG_PROP_AREA) - 1) != 0)
+				continue;
+			if (!kg_prop_lookup(uid, appid, p, spot[n].redirect,
+					    KG_PROP_LEN))
+				continue;
+			spot[n].addr = vma->vm_start;
+			spot[n].len = vma->vm_end - vma->vm_start;
+			n++;
+		}
+	}
+	mmap_read_unlock(mm);
+
+	/* vm_mmap takes mmap_lock itself, so the swap happens without it */
+	for (i = 0; i < n; i++) {
+		struct file *f;
+		unsigned long got;
+		loff_t size;
+
+		f = filp_open(spot[i].redirect, O_RDONLY | O_CLOEXEC, 0);
+		if (IS_ERR(f))
+			continue;
+		size = i_size_read(file_inode(f));
+		if (size < (loff_t)spot[i].len) {
+			filp_close(f, NULL);
+			continue;
+		}
+		got = vm_mmap(f, spot[i].addr, spot[i].len, PROT_READ,
+			      MAP_PRIVATE | MAP_FIXED, 0);
+		filp_close(f, NULL);
+		if (IS_ERR_VALUE(got))
+			pr_warn_ratelimited("uid %u remap %s failed %ld\n",
+					    uid, spot[i].redirect, (long)got);
+		else
+			pr_info_ratelimited("uid %u remap %s at %lx\n",
+					    uid, spot[i].redirect,
+					    spot[i].addr);
+	}
+
+out:
+	kfree(spot);
+	kfree(buf);
+}
+
+static void kg_prop_remap_work(struct callback_head *cb)
+{
+	kfree(cb);
+	kg_prop_remap_now();
+}
+
+/*
+ * Called from commit_creds(). Mapping work must not happen there, so the
+ * swap is deferred to the return to user space, where nothing is held.
+ */
+void kg_prop_cred_changed(void)
+{
+	struct callback_head *cb;
+	u32 uid, appid;
+
+	if (!current->mm || (current->flags & PF_KTHREAD))
+		return;
+
+	uid = from_kuid(&init_user_ns, current_uid());
+	appid = uid % KG_USER_OFF;
+	if (appid < KG_APP_MIN || appid > KG_APP_MAX)
+		return;
+	if (!kg_prop_wanted(uid, appid))
+		return;
+
+	cb = kmalloc(sizeof(*cb), GFP_ATOMIC);
+	if (!cb)
+		return;
+
+	init_task_work(cb, kg_prop_remap_work);
+	if (task_work_add(current, cb, TWA_RESUME))
+		kfree(cb);
 }
 
 static const struct proc_ops kg_prop_proc_ops = {

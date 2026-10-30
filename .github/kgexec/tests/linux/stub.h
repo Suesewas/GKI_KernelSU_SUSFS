@@ -27,7 +27,8 @@ extern u32 kg_test_uid;
 static inline kuid_t current_uid(void) { kuid_t k; k.val = kg_test_uid; return k; }
 static inline u32 from_kuid(struct user_namespace *ns, kuid_t k) { (void)ns; return k.val; }
 
-struct task { const char *comm; };
+struct mm_struct;
+struct task { const char *comm; struct mm_struct *mm; int flags; };
 extern struct task kg_current;
 #define current (&kg_current)
 
@@ -76,4 +77,6 @@ static inline struct filename *getname_kernel(const char *s) {
     kg_last_out = f;
     return f;
 }
+#include "linux/remapstub.h"
+
 #endif

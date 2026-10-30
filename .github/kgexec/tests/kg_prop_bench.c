@@ -4,6 +4,11 @@ struct user_namespace init_user_ns;
 u32 kg_test_uid = 0;
 struct task kg_current = { "bench" };
 struct filename *kg_last_out = NULL;
+struct kg_remap_log kg_remaps[16];
+int kg_remap_n = 0;
+int kg_open_fail = 0;
+long kg_open_size = 128 * 1024;
+static struct mm_struct kg_mm;
 
 #define static_cut static
 #include "kg_prop_body.c"
@@ -28,6 +33,80 @@ static const char *redir(u32 uid, const char *path) {
     kg_last_out = NULL;
     struct filename *out = kg_prop_redirect(&in);
     return out ? out->name : NULL;
+}
+
+/* -- подмена унаследованного отображения -- */
+static struct file g_files[8];
+static struct vm_area_struct g_vmas[8];
+
+static void map(int i, const char *path, unsigned long addr, unsigned long len)
+{
+    g_files[i].f_path.name = path;
+    g_files[i].size = 128 * 1024;
+    g_vmas[i].vm_start = addr;
+    g_vmas[i].vm_end = addr + len;
+    g_vmas[i].vm_file = &g_files[i];
+}
+
+static void remap_case(u32 uid, int n)
+{
+    kg_mm.v = g_vmas;
+    kg_mm.n = n;
+    kg_current.mm = &kg_mm;
+    kg_test_uid = uid;
+    kg_remap_n = 0;
+    kg_prop_cred_changed();
+}
+
+static void bench_remap(void)
+{
+    const unsigned long L = 128 * 1024;
+
+    kg_prop_proc_write(NULL, "clear", 5, NULL);
+    add(10324, "/dev/__properties__/u:object_r:build_prop:s0",
+        "/dev/envspoof/p10324/u:object_r:build_prop:s0");
+    add(10324, "/dev/__properties__/u:object_r:radio_prop:s0",
+        "/dev/envspoof/p10324/u:object_r:radio_prop:s0");
+
+    map(0, "/dev/__properties__/property_info", 0x1000, L);
+    map(1, "/dev/__properties__/u:object_r:build_prop:s0", 0x40000, L);
+    map(2, "/dev/__properties__/u:object_r:radio_prop:s0", 0x80000, L);
+    map(3, "/dev/__properties__/u:object_r:other_prop:s0", 0xc0000, L);
+    map(4, "/apex/com.android.runtime/lib64/bionic/libc.so", 0x200000, L);
+
+    remap_case(10324, 5);
+    chk("подменены только два отображения с правилом", kg_remap_n == 2);
+    chk("первое взято из каталога этого uid",
+        kg_remap_n > 0 && strcmp(kg_remaps[0].src,
+            "/dev/envspoof/p10324/u:object_r:build_prop:s0") == 0);
+    chk("адрес и длина сохранены",
+        kg_remap_n > 0 && kg_remaps[0].addr == 0x40000 && kg_remaps[0].len == L);
+    chk("второе отображение тоже подменено",
+        kg_remap_n > 1 && strcmp(kg_remaps[1].src,
+            "/dev/envspoof/p10324/u:object_r:radio_prop:s0") == 0);
+
+    remap_case(10999, 5);
+    chk("чужому uid не подменяется ничего", kg_remap_n == 0);
+
+    remap_case(0, 5);
+    chk("системному uid не подменяется ничего", kg_remap_n == 0);
+
+    kg_open_fail = 1;
+    remap_case(10324, 5);
+    chk("недоступная копия пропускается", kg_remap_n == 0);
+    kg_open_fail = 0;
+
+    kg_open_size = 4096;
+    remap_case(10324, 5);
+    chk("копия короче отображения пропускается", kg_remap_n == 0);
+    kg_open_size = 128 * 1024;
+
+    kg_current.mm = NULL;
+    kg_test_uid = 10324;
+    kg_remap_n = 0;
+    kg_prop_cred_changed();
+    chk("процесс без mm не трогается", kg_remap_n == 0);
+    kg_current.mm = &kg_mm;
 }
 
 int main(void) {
@@ -98,6 +177,8 @@ int main(void) {
     snprintf(cmd, sizeof(cmd), "clear");
     kg_prop_proc_write(NULL, cmd, strlen(cmd), NULL);
     chk("после clear ничего не ловится", redir(10091, "/proc/version") == NULL);
+
+    bench_remap();
 
     if (fails == 0) printf("KGPROP-OK\n");
     return fails == 0 ? 0 : 1;

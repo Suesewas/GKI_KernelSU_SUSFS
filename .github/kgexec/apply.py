@@ -44,6 +44,11 @@ PROP_HOOK = (
 
 PROP_MAKEFILE_LINE = "obj-y += kg_prop.o\n"
 
+PROP_CRED_HOOK = (
+    "\tif (static_branch_unlikely(&kg_prop_key))\n"
+    "\t\tkg_prop_cred_changed();\n"
+)
+
 DEX_INCLUDE_LINE = "#include <linux/kg_execmem.h>\n"
 
 DEX_ANCHOR = "\t\t\tfd_install(fd, f);\n"
@@ -322,6 +327,8 @@ def verify(root):
         ("fs/open.c", "#include <linux/kg_prop.h>"),
         ("fs/Makefile", "kg_prop.o"),
         ("fs/kg_prop.c", "DEFINE_STATIC_KEY_FALSE(kg_prop_key)"),
+        ("fs/kg_prop.c", "kg_prop_cred_changed"),
+        ("kernel/cred.c", "kg_prop_cred_changed"),
         ("include/linux/kg_prop.h", "DECLARE_STATIC_KEY_FALSE(kg_prop_key)"),
         ("kernel/kg_cred.c", "DEFINE_STATIC_KEY_FALSE(kg_cred_key)"),
         ("include/linux/kg_cred.h", "DECLARE_STATIC_KEY_FALSE(kg_cred_key)"),
@@ -343,6 +350,24 @@ def verify(root):
             fail("verify: %s in %s found %d times"
                  % (needle, rel, src.count(needle)))
     print("kgexec: verify ok")
+
+
+def patch_prop_cred(root):
+    """the inherited property area is swapped when the process becomes an app"""
+    path = os.path.join(root, "kernel/cred.c")
+    src = read(path)
+    if "kg_prop_cred_changed" in src:
+        print("kgexec: kernel/cred.c already has the prop hook")
+        return
+    if PROP_INCLUDE_LINE not in src:
+        src = insert_after(src, "#include <linux/security.h>\n",
+                           PROP_INCLUDE_LINE, "kernel/cred.c prop include")
+    if src.count(CRED_COMMIT_ALT) != 1:
+        fail("kernel/cred.c: no usable anchor for the prop hook")
+    src = insert_after(src, CRED_COMMIT_ALT, PROP_CRED_HOOK,
+                       "kernel/cred.c prop hook")
+    write(path, src)
+    print("kgexec: patched kernel/cred.c with the prop hook")
 
 
 def main():
@@ -385,6 +410,7 @@ def main():
     patch_makefile(os.path.join(root, "kernel/Makefile"), CRED_MAKEFILE_LINE,
                    "kernel/Makefile")
     patch_cred(root)
+    patch_prop_cred(root)
 
     verify(root)
 
