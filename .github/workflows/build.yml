@@ -646,6 +646,14 @@ jobs:
         python3 "${{ github.workspace }}/.github/scripts/pack_boot.py" \
           "$OUT/Image.lz4" "$OUT/boot.img"
         ls -l "$OUT/boot.img"
+        sha256sum "$OUT/boot.img" | awk '{print $1}' > "$OUT/boot.img.sha256"
+        echo "boot.img sha256 $(cat "$OUT/boot.img.sha256")"
+        {
+          echo "### boot.img"
+          echo
+          echo "- size: $(stat -c %s "$OUT/boot.img")"
+          echo "- sha256: \`$(cat "$OUT/boot.img.sha256")\`"
+        } >> "$GITHUB_STEP_SUMMARY"
         echo "made=1" >> "$GITHUB_OUTPUT"
 
     - name: Upload Boot Image
@@ -653,7 +661,9 @@ jobs:
       uses: actions/upload-artifact@v7
       with:
         name: ${{ steps.extract.outputs.file_name }}-boot.img
-        path: ${{ github.workspace }}/boot-out/boot.img
+        path: |
+          ${{ github.workspace }}/boot-out/boot.img
+          ${{ github.workspace }}/boot-out/boot.img.sha256
         if-no-files-found: ignore
         compression-level: 0
 
