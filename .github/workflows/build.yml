@@ -67,7 +67,7 @@ on:
       brand_name:
         required: false
         type: string
-        default: Wild
+        default: ""
       keep_kmi:
         required: false
         type: boolean
@@ -377,6 +377,10 @@ jobs:
           kernel_version: ${{ inputs.kernel_version }}
           sublevel: ${{ steps.extract.outputs.sublevel }}
 
+      - name: Apply kGuard Execmem Patch
+        if: contains(inputs.feature_set, 'KGExec')
+        uses: ./.github/actions/kgexec
+
       - name: Apply Device-Specific Patches
         uses: ./.github/actions/apply-device-patches
         with:
@@ -488,6 +492,15 @@ jobs:
           version: ${{ inputs.version }}
           page_size: ${{ inputs.page_size }}
 
+      - name: Verify kgexec kernel options
+        if: contains(inputs.feature_set, 'KGExec')
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="${{ github.workspace }}/AnyKernel3/Image"
+          [ -f "$IMG" ] || { echo "no built Image at $IMG"; exit 1; }
+          python3 "${{ github.workspace }}/.github/kgexec/checkcfg.py" "$IMG"
+
       - name: Get Cache Stats
         uses: ./.github/actions/cache-stats
         with:
@@ -542,6 +555,49 @@ jobs:
           feature_set: ${{ inputs.feature_set }}
           nomount_commit: ${{ inputs.nomount_commit }}
           susfs_commit: ${{ inputs.susfs_commit }}
+
+      - name: Pack Boot Image
+        id: bootimg
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMG="${{ github.workspace }}/AnyKernel3/Image"
+          if [ ! -f "$IMG" ]; then
+            echo "no Image, skipping boot.img"
+            exit 0
+          fi
+          OUT="${{ github.workspace }}/boot-out"
+          mkdir -p "$OUT"
+          MAGIC=$(head -c 4 "$IMG" | od -An -tx1 | tr -d ' \n')
+          if [ "$MAGIC" = "02214c18" ]; then
+            cp "$IMG" "$OUT/Image.lz4"
+          else
+            command -v lz4 >/dev/null || sudo apt-get install -y -qq lz4
+            lz4 -l -12 -f "$IMG" "$OUT/Image.lz4"
+          fi
+          python3 "${{ github.workspace }}/.github/scripts/pack_boot.py" \
+            "$OUT/Image.lz4" "$OUT/boot.img"
+          ls -l "$OUT/boot.img"
+          sha256sum "$OUT/boot.img" | awk '{print $1}' > "$OUT/boot.img.sha256"
+          echo "boot.img sha256 $(cat "$OUT/boot.img.sha256")"
+          {
+            echo "### boot.img"
+            echo
+            echo "- size: $(stat -c %s "$OUT/boot.img")"
+            echo "- sha256: \`$(cat "$OUT/boot.img.sha256")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "made=1" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Boot Image
+        if: steps.bootimg.outputs.made == '1'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.extract.outputs.file_name }}-boot.img
+          path: |
+            ${{ github.workspace }}/boot-out/boot.img
+            ${{ github.workspace }}/boot-out/boot.img.sha256
+          if-no-files-found: ignore
+          compression-level: 0
 
       - name: Upload Artifacts
         id: kernel-artifact

@@ -1,0 +1,82 @@
+name: 'Fragnesia fixes'
+description: 'CVE-2026-46300: coalesce + segment halves'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Fragnesia coalesce half
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import sys
+        p = "net/core/skbuff.c"
+        src = open(p).read()
+        if "CVE-2026-46300-co" in src:
+            print("coalesce: already patched"); sys.exit(0)
+        OLD = ("\tmemcpy(to_shinfo->frags + to_shinfo->nr_frags,\n"
+               "\t       from_shinfo->frags,\n"
+               "\t       from_shinfo->nr_frags * sizeof(skb_frag_t));\n"
+               "\tto_shinfo->nr_frags += from_shinfo->nr_frags;\n")
+        n = src.count(OLD)
+        print("coalesce sites: %d" % n)
+        if n != 1:
+            sys.exit(1)
+        src = src.replace(OLD, OLD + "\tto_shinfo->flags |= from_shinfo->flags & SKBFL_SHARED_FRAG; /* CVE-2026-46300-co */\n", 1)
+        open(p, "w").write(src)
+        print("coalesce: patched")
+        PYEOF
+
+    - name: Fragnesia segment half
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import re, sys
+        p = "net/core/skbuff.c"
+        src = open(p).read()
+        if "CVE-2026-46300-seg" in src:
+            print("segment: already patched"); sys.exit(0)
+
+        print("--- all SKBFL_SHARED_FRAG occurrences ---")
+        for m in re.finditer(r"SKBFL_SHARED_FRAG", src):
+            line_no = src.count("\n", 0, m.start()) + 1
+            line = src.splitlines()[line_no-1]
+            print("   line %d: %r" % (line_no, line))
+
+        hits = [m for m in re.finditer(r"\n([ \t]+)frag_skb = list_skb;[ \t]*\n", src)]
+        print("inner-loop sites: %d" % len(hits))
+        if not hits:
+            sys.exit(1)
+        m = hits[-1]; ind = m.group(1)
+        src = src[:m.end()] + ind + "skb_shinfo(nskb)->flags |= skb_shinfo(frag_skb)->flags & SKBFL_SHARED_FRAG; /* CVE-2026-46300-seg */\n" + src[m.end():]
+
+        rx = re.compile(r"([ \t]*)skb_shinfo\(nskb\)->flags[ \t]*\|=[ \t]*skb_shinfo\(head_skb\)->flags[ \t]*&[ \t]*\n[ \t]*SKBFL_SHARED_FRAG;[ \t]*\n")
+        ms = list(rx.finditer(src))
+        print("nskb-creation sites: %d" % len(ms))
+        if len(ms) == 1:
+            g = ms[0]; i2 = g.group(1)
+            rep = (i2 + "skb_shinfo(nskb)->flags |= (skb_shinfo(head_skb)->flags |\n"
+                   + i2 + "\t\t\t    skb_shinfo(frag_skb)->flags) &\n"
+                   + i2 + "\t\t\t   SKBFL_SHARED_FRAG; /* CVE-2026-46300-seg2 */\n")
+            src = src[:g.start()] + rep + src[g.end():]
+            print("creation site: patched")
+        else:
+            print("creation site: NOT FOUND, continuing without it")
+
+        open(p, "w").write(src)
+        print("segment: applied")
+        PYEOF
+
+    - name: Verify
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        set -euo pipefail
+        S=net/core/skbuff.c
+        grep -q "CVE-2026-46300-co" "$S" || { echo "coalesce marker missing"; exit 1; }
+        grep -q "CVE-2026-46300-seg" "$S" || { echo "segment marker missing"; exit 1; }
+        grep -c "SKBFL_SHARED_FRAG" "$S"
+        echo "verified"

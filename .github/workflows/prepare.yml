@@ -65,7 +65,7 @@ on:
         description: "Kernel branding text appended to the version string (empty = stock)"
         required: false
         type: string
-        default: Wild
+        default: ""
       keep_kmi:
         description: "Keep stock KMI generation suffix in kernel version (fix #265)"
         required: false

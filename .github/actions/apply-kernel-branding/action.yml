@@ -38,10 +38,13 @@ runs:
         BRAND="${{ inputs.brand_name }}"
         KEEP_KMI="${{ inputs.keep_kmi }}"
 
-        if [ -z "$BRAND" ]; then
+        if [ -z "$BRAND" ] && [ "$KEEP_KMI" = "true" ]; then
           echo "brand_name is empty, keeping stock kernel version string"
           exit 0
         fi
+
+        SUF=""
+        [ -n "$BRAND" ] && SUF="-$BRAND"
 
         KMI=""
         if [ "$KEEP_KMI" = "true" ]; then
@@ -60,9 +63,9 @@ runs:
         else
           if [[ ${{ inputs.version }} == "android15-6.6" || ${{ inputs.version }} == "android16-6.12" || ${{ inputs.version }} == "android17-6.18" ]]; then
             KERNEL_STRING="$KERNEL_PART.${{ inputs.sublevel }}-$ANDROID_PART"
-            sed -i '$d' scripts/setlocalversion && echo "echo \"$KERNEL_STRING-$BRAND\"" >> scripts/setlocalversion
+            sed -i '$d' scripts/setlocalversion && echo "echo \"$KERNEL_STRING$SUF\"" >> scripts/setlocalversion
           else
-            sed -i '$d' scripts/setlocalversion && echo "echo \"-$ANDROID_PART-$BRAND\"" >> scripts/setlocalversion
+            sed -i '$d' scripts/setlocalversion && echo "echo \"-$ANDROID_PART$SUF\"" >> scripts/setlocalversion
           fi
         fi
         chmod +x scripts/setlocalversion

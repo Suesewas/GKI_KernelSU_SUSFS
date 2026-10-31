@@ -1,0 +1,42 @@
+name: 'Apply kGuard Execmem Patch'
+description: 'Deny anonymous and out-of-tree executable mappings for listed app ids'
+
+runs:
+  using: composite
+  steps:
+    - name: Apply kgexec patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 "${{ github.workspace }}/.github/kgexec/apply.py" \
+          "${{ github.workspace }}/kernel/common" \
+          "${{ github.workspace }}/.github/kgexec"
+
+    - name: Require kgexec kernel options
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        set -euo pipefail
+        D=arch/arm64/configs/gki_defconfig
+        [ -f "$D" ] || { echo "gki_defconfig not found"; exit 1; }
+        want() {
+          sed -i "/^CONFIG_$1=/d; /^# CONFIG_$1 is not set\$/d" "$D"
+          echo "CONFIG_$1=y" >> "$D"
+          grep -q "^CONFIG_$1=y\$" "$D" || { echo "failed to set CONFIG_$1"; exit 1; }
+        }
+        want UPROBES
+        want UPROBE_EVENTS
+        K="$(grep -rl '^config PROC_MEM_FORCE_PTRACE$' --include='Kconfig*' . | head -1)"
+        if [ -n "$K" ]; then
+          for s in PROC_MEM_ALWAYS_FORCE PROC_MEM_FORCE_PTRACE PROC_MEM_NO_FORCE; do
+            sed -i "/^CONFIG_$s=/d; /^# CONFIG_$s is not set\$/d" "$D"
+          done
+          echo 'CONFIG_PROC_MEM_FORCE_PTRACE=y' >> "$D"
+          grep -q '^CONFIG_PROC_MEM_FORCE_PTRACE=y$' "$D" ||
+            { echo "failed to set CONFIG_PROC_MEM_FORCE_PTRACE"; exit 1; }
+          echo "kgexec: PROC_MEM choice found in $K, forced writes limited to ptrace attachers"
+        else
+          echo "kgexec: no PROC_MEM choice in this tree"
+          exit 1
+        fi
+        echo "kgexec: UPROBES on, the ART layer will arm"

@@ -194,7 +194,42 @@ runs:
         else
           # Deliberately no --forward (PR #342 uses --batch --forward here):
           # a reversed/already-applied hunk must fail loudly, not be skipped.
-          patch -p1 < 50_add_susfs_in_gki-${{ inputs.version }}.patch
+          P=50_add_susfs_in_gki-${{ inputs.version }}.patch
+          FIXED157=0
+          if ! patch -p1 -s --dry-run < "$P" >/dev/null 2>&1; then
+            if [ "${{ inputs.version }}" = "android14-6.1" ] && [ "${{ inputs.sublevel }}" -ge 157 ]; then
+              echo "SUSFS patch does not fit as is, applying the 157+ include fixups"
+              sed -i '/^#include <trace\/hooks\/blk.h>$/d' fs/namespace.c
+              sed -i '/^#include <trace\/hooks\/fs.h>$/,+1 d' fs/super.c
+              FIXED157=1
+              if patch -p1 -s --dry-run < "$P" >/dev/null 2>&1; then
+                echo "fixups helped, the patch applies now"
+              else
+                echo "::warning title=SUSFS::157+ fixups did not help, applying anyway to collect rejects"
+              fi
+            fi
+          else
+            echo "SUSFS patch applies as is, no fixups needed"
+          fi
+          if ! patch -p1 < "$P"; then
+            shown=0
+            for r in $(find . -name '*.rej' | head -3); do
+              echo "::error title=SUSFS reject::$r"
+              while IFS= read -r l; do
+                shown=$((shown+1))
+                [ "$shown" -gt 24 ] && break
+                echo "::error::${l//$'\r'/}"
+              done < <(head -10 "$r")
+            done
+            exit 1
+          fi
+          if [ "$FIXED157" = "1" ]; then
+            echo "Restoring the 157+ include context removed before patching"
+            grep -q '^#include <trace/hooks/blk.h>$' fs/namespace.c || \
+              sed -i '/^#include "internal.h"$/a #include <trace\/hooks\/blk.h>' fs/namespace.c
+            grep -q '^#include <trace/hooks/fs.h>$' fs/super.c || \
+              sed -i '/^#include "internal.h"$/a #include <trace\/hooks\/fs.h>' fs/super.c
+          fi
         fi
 
         # SUSFS's OPEN_REDIRECT code unconditionally calls VMA_PAD_START(), which

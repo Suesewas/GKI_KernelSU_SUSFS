@@ -1,0 +1,71 @@
+name: kGuard Handoff
+
+# Artifacts from Actions runs are only downloadable with a browser session,
+# which makes handing a build to a headless consumer a manual step. This
+# workflow re-publishes one artifact of one run as an asset of a throwaway
+# prerelease, which plain HTTPS can fetch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Run id whose artifact to publish"
+        required: true
+        type: string
+      artifact:
+        description: "Artifact name (empty: every artifact of the run)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  handoff:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: kg-handoff
+    steps:
+      - name: Download artifacts of the named run
+        uses: actions/download-artifact@v7
+        with:
+          run-id: ${{ inputs.run_id }}
+          name: ${{ inputs.artifact }}
+          path: handoff
+          github-token: ${{ github.token }}
+          merge-multiple: false
+
+      - name: Pack each artifact into one zip
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          if [ -n "${{ inputs.artifact }}" ]; then
+            (cd handoff && zip -q -r "../out/${{ inputs.artifact }}.zip" .)
+          else
+            for d in handoff/*; do
+              [ -d "$d" ] || continue
+              n=$(basename "$d")
+              (cd "$d" && zip -q -r "../../out/$n.zip" .)
+            done
+          fi
+          ls -la out
+          sha256sum out/*.zip
+
+      - name: Replace the handoff prerelease
+        run: |
+          set -euo pipefail
+          gh release delete "$TAG" --cleanup-tag -y || true
+          gh release create "$TAG" \
+            --target "${{ github.sha }}" \
+            --prerelease \
+            --title "Handoff from run ${{ inputs.run_id }}" \
+            --notes "Temporary assets re-published from run ${{ inputs.run_id }} so they can be fetched over plain HTTPS. Replaced by the next handoff."
+          for f in out/*.zip; do
+            gh release upload "$TAG" "$f" --clobber
+          done
+          gh release view "$TAG" --json assets \
+            --jq '.assets[] | "\(.name) \(.size)"' || true

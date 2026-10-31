@@ -1,0 +1,48 @@
+name: 'Fragnesia fix only'
+description: 'CVE-2026-46300: propagate SKBFL_SHARED_FRAG in skb_try_coalesce'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Fix CVE-2026-46300 (flag lost on coalesce)
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        set -euo pipefail
+        python3 - <<'PYEOF'
+        import sys
+
+        MARK = "CVE-2026-46300"
+        p = "net/core/skbuff.c"
+        src = open(p).read()
+
+        if MARK in src:
+            print("%s: already patched" % p)
+            sys.exit(0)
+
+        OLD = ("\tmemcpy(to_shinfo->frags + to_shinfo->nr_frags,\n"
+               "\t       from_shinfo->frags,\n"
+               "\t       from_shinfo->nr_frags * sizeof(skb_frag_t));\n"
+               "\tto_shinfo->nr_frags += from_shinfo->nr_frags;\n")
+        NEW = OLD + "\tto_shinfo->flags |= from_shinfo->flags & SKBFL_SHARED_FRAG; /* CVE-2026-46300 */\n"
+
+        n = src.count(OLD)
+        if n != 1:
+            print("%s: ERROR - %d matches instead of 1" % (p, n))
+            sys.exit(1)
+        open(p, "w").write(src.replace(OLD, NEW, 1))
+        print("%s: patched" % p)
+        PYEOF
+
+    - name: Verify the fix
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        set -euo pipefail
+        S=net/core/skbuff.c
+        grep -q "CVE-2026-46300" "$S" || { echo "no marker in $S"; exit 1; }
+        BODY="$(awk '/^bool skb_try_coalesce/,/^EXPORT_SYMBOL\(skb_try_coalesce\)/' "$S")"
+        [ "$(printf '%s\n' "$BODY" | wc -l)" -gt 40 ] || { echo "skb_try_coalesce body not found"; exit 1; }
+        printf '%s\n' "$BODY" | grep -q "to_shinfo->flags |= from_shinfo->flags & SKBFL_SHARED_FRAG" || { echo "flag not propagated"; exit 1; }
+        printf '%s\n' "$BODY" | grep -q "return true;" || { echo "function truncated"; exit 1; }
+        echo "$S: verified"
