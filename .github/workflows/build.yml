@@ -63,6 +63,31 @@ on:
         required: false
         type: string
         default: ""
+      keep_kmi:
+        description: "Keep stock KMI generation suffix in the kernel version"
+        required: false
+        type: boolean
+        default: false
+      allow_version_mismatch:
+        description: "Force-load modules with mismatched symbol versions"
+        required: false
+        type: boolean
+        default: false
+      page_size:
+        description: "ARM64 page size: 4k (default) or 16k (Kleaf --page_size)"
+        required: false
+        type: string
+        default: "4k"
+      runner:
+        description: "Runner image label"
+        required: false
+        type: string
+        default: "ubuntu-24.04"
+      stock_config_artifact:
+        description: "Artifact name with prefetched stock configs"
+        required: false
+        type: string
+        default: ""
       bypass:
         required: false
         type: boolean
@@ -76,7 +101,7 @@ on:
 jobs:
   build-gki:
     name: "${{ inputs.kernel_version }}.${{ inputs.sublevel }}-${{ inputs.android_version }}-${{ inputs.os_patch_level }} (${{ inputs.variant }})"
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
     timeout-minutes: 120
 
     steps:
@@ -279,6 +304,9 @@ jobs:
       with:
         version: ${{ inputs.version }}
         kernel_version: ${{ inputs.kernel_version }}
+        android_version: ${{ inputs.android_version }}
+        sublevel: ${{ steps.extract.outputs.sublevel }}
+        os_patch_level: ${{ inputs.os_patch_level }}
         droidspaces_commit: ${{ inputs.droidspaces_commit }}
 
     - name: Apply NTSync Patches
@@ -364,6 +392,7 @@ jobs:
         version: ${{ inputs.version }}
         sublevel: ${{ steps.extract.outputs.sublevel }}
         brand_name: ${{ inputs.brand_name }}
+        keep_kmi: ${{ inputs.keep_kmi }}
 
     - name: Remove Protected Exports
       uses: ./.github/actions/remove-protected-exports
@@ -461,7 +490,6 @@ jobs:
       uses: ./.github/actions/bypass-kernel
       with:
         version: ${{ inputs.version }}
-        bypass: true
 
     - name: Build Normal Kernel
       env:
@@ -470,6 +498,8 @@ jobs:
       uses: ./.github/actions/build-kernel
       with:
         version: ${{ inputs.version }}
+        page_size: ${{ inputs.page_size }}
+        allow_version_mismatch: ${{ inputs.allow_version_mismatch }}
 
     - name: Verify kgexec kernel options
       if: contains(inputs.feature_set, 'KGExec')
@@ -526,6 +556,8 @@ jobs:
       uses: ./.github/actions/build-kernel
       with:
         version: ${{ inputs.version }}
+        page_size: ${{ inputs.page_size }}
+        allow_version_mismatch: ${{ inputs.allow_version_mismatch }}
 
     - name: Consolidated Build Summary
       if: always()

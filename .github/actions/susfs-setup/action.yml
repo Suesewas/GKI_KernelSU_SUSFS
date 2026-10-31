@@ -8,6 +8,10 @@ inputs:
   version:
     description: 'Kernel config version (e.g., android15-6.6)'
     required: true
+  root_flavor:
+    description: 'Selected root implementation - pershoot patches only apply to next'
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -46,24 +50,24 @@ runs:
         echo "SUSFS_COMMIT=$SUSFS_COMMIT" >> "$GITHUB_ENV"
         echo "Using SUSFS commit: $SUSFS_COMMIT"
 
-        # kernel_patches@4285cd1 deleted these two patches while this action
-        # still applies them. Fall back to the commit right before the deletion.
-        PERSHOOT_PIN=757201d983e2549dc7945a21fa6a056eb2e55263
-        PERSHOOT_RAW="https://raw.githubusercontent.com/WildKernels/kernel_patches/${PERSHOOT_PIN}/pershoot/susfs4ksu"
-        for p in 0001-pershoot-Allow-core-to-be-built-with-no-features.patch \
-                 0002-pershoot-Implement-SuSFS-and-Toolkit-coexistence.patch; do
-          LOCAL="${{ github.workspace }}/kernel_patches/pershoot/susfs4ksu/$p"
-          if [ ! -f "$LOCAL" ]; then
-            echo "missing in kernel_patches, fetching from pin: $p"
-            mkdir -p "$(dirname "$LOCAL")"
-            retry curl -fsSL -o "$LOCAL" "$PERSHOOT_RAW/$p"
-          fi
-          if patch -p1 -s --dry-run < "$LOCAL" >/dev/null 2>&1; then
-            patch -p1 < "$LOCAL"
-            echo "applied: $p"
-          elif patch -p1 -s -R --dry-run < "$LOCAL" >/dev/null 2>&1; then
-            echo "already in the SUSFS tree, skipped: $p"
-          else
-            echo "::warning title=pershoot patch skipped::$p does not apply to this SUSFS tree"
-          fi
-        done
+        # Pershoot's KernelSU-Next (dev-susfs fork) SUSFS fixes. Other flavors use
+        # the simonpunk checkout as-is.
+        #
+        # Two specific commits, in order (verified clean by rehearsal):
+        #   6387756 fs/susfs: Allow core to be built with no features
+        #   161c058 fs/susfs: Implement SuSFS and Toolkit coexistence
+        #     -> cherry-picked for ALL families: they touch only
+        #        kernel_patches/fs/susfs.c and apply cleanly on 6.1, 6.6
+        #        and 6.12 (tested per-branch).
+        #   (35b2a01, the SELinux time side-channel 50_add rewrite, was
+        #        REMOVED per owner decision - it conflicted on every branch
+        #        and its file-overwrite workaround is no longer wanted.)
+        # Fail-loud: a failed pick must kill the job, never march on with a
+        # half-merged tree.
+        if [ "${{ inputs.root_flavor }}" = "next" ]; then
+          git fetch https://gitlab.com/pershoot/susfs4ksu.git \
+            6387756d64b3ab9ececefc4523627a9ee05a7519 \
+            161c058fed5544a6573d87124f346dadd5c4962d
+          git cherry-pick 6387756d64b3ab9ececefc4523627a9ee05a7519
+          git cherry-pick 161c058fed5544a6573d87124f346dadd5c4962d
+        fi

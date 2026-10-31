@@ -32,6 +32,10 @@ runs:
         attempts: 5
         delay: 5
         workdir: ${{ github.workspace }}
+        # A clone that dies mid-transfer leaves Droidspaces-OSS/ behind, and
+        # the next attempt then fails instantly with "destination path already
+        # exists" — so without this, all 5 attempts fail deterministically.
+        cleanup: rm -rf Droidspaces-OSS
 
     - name: Pin Droidspaces-OSS to resolved commit
       shell: bash

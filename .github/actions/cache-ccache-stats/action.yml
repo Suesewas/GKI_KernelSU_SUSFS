@@ -55,7 +55,10 @@ runs:
           echo "====================="
 
           if [ -d /home/runner/.ccache ] && find /home/runner/.ccache -type f -print -quit 2>/dev/null | grep -q .; then
+            # -mtime, not atime: ccache's own LRU is mtime-based, and the
+            # prune in build.yml filters on -mtime too. The log line used to
+            # say "atime" which is what made this look like a bug.
             find /home/runner/.ccache -type f -exec touch -t $(date -d "1 day ago" +%Y%m%d%H%M) {} +
-            echo "[+] ccache atime updated"
+            echo "[+] ccache mtime updated"
           fi
         fi

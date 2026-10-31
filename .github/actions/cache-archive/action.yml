@@ -108,7 +108,7 @@ runs:
           echo "Split complete, $NEW_PARTS_COUNT parts created"
 
           # Remove old single-file asset if switching to split parts
-          ALL_ASSETS=$(curl -sL -A "Mozilla/5.0" -w "%{http_code}" "https://github.com/${TARGET_REPO}/releases/expanded_assets/$TAG_NAME" -o assets.html 2>/dev/null || echo "0")
+          ALL_ASSETS=$(curl -sL -A "Mozilla/5.0" --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 30 -w "%{http_code}" "https://github.com/${TARGET_REPO}/releases/expanded_assets/$TAG_NAME" -o assets.html 2>/dev/null || echo "0")
           if [ "$ALL_ASSETS" = "200" ]; then
             ALL_ASSETS=$(grep -oP "download/$TAG_NAME/\K[\"' ]+" assets.html 2>/dev/null || echo "")
             if echo "$ALL_ASSETS" | grep -xF "${FILENAME}" >/dev/null 2>&1; then
@@ -129,7 +129,7 @@ runs:
           rm -f assets.html
         else
           # Remove old split parts if new build fits in a single file
-          ALL_ASSETS=$(curl -sL -A "Mozilla/5.0" -w "%{http_code}" "https://github.com/${TARGET_REPO}/releases/expanded_assets/$TAG_NAME" -o assets.html 2>/dev/null || echo "0")
+          ALL_ASSETS=$(curl -sL -A "Mozilla/5.0" --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 30 -w "%{http_code}" "https://github.com/${TARGET_REPO}/releases/expanded_assets/$TAG_NAME" -o assets.html 2>/dev/null || echo "0")
           if [ "$ALL_ASSETS" = "200" ]; then
             OLD_PARTS=$(grep -F "${FILENAME}.part" assets.html 2>/dev/null || echo "")
             if [ -n "$OLD_PARTS" ]; then

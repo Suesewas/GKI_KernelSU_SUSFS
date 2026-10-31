@@ -2,7 +2,7 @@ name: Setup pinned root implementation
 description: Clone exactly one supported root implementation at a verified commit
 inputs:
   flavor:
-    description: 'kernelsu, next, or resukisu'
+    description: "kernelsu, next, bakasu, finasu, sukisu-ultra, or kowsu"
     required: true
   commit:
     description: 'Full immutable commit SHA'
@@ -30,10 +30,25 @@ runs:
             directory="KernelSU-Next"
             manager="KernelSU Next Manager"
             ;;
-          resukisu)
-            repo="https://github.com/ReSukiSU/ReSukiSU.git"
-            directory="ReSukiSU"
-            manager="ReSukiSU Manager"
+          bakasu)
+            repo="https://github.com/Baka-SU/BakaSU.git"
+            directory="BakaSU"
+            manager="BakaSU Manager"
+            ;;
+          sukisu-ultra)
+            repo="https://github.com/SukiSU-Ultra/SukiSU-Ultra.git"
+            directory="SukiSU-Ultra"
+            manager="SukiSU-Ultra Manager"
+            ;;
+          kowsu)
+            repo="https://github.com/KOWX712/KernelSU.git"
+            directory="KowSU"
+            manager="KowSU Manager"
+            ;;
+          finasu)
+            repo="https://github.com/LyraVoid/FinaSU.git"
+            directory="FinaSU"
+            manager="FinaSU Manager"
             ;;
           *)
             echo "Unsupported root flavor: $flavor" >&2
@@ -46,7 +61,7 @@ runs:
           exit 2
         fi
 
-        for candidate in KernelSU KernelSU-Next ReSukiSU; do
+        for candidate in KernelSU KernelSU-Next BakaSU FinaSU SukiSU-Ultra KowSU; do
           if [ "$candidate" != "$directory" ] && [ -e "$candidate" ]; then
             echo "Refusing mixed root implementations: found $candidate." >&2
             exit 1
@@ -103,10 +118,63 @@ runs:
         config_list: |
           CONFIG_KSU=y
 
-    - name: Disable multi-manager for ReSukiSU
-      if: inputs.flavor == 'resukisu'
+    - name: Soften KernelSU-Next Kbuild config guard for mrproper
+      if: inputs.flavor == 'next'
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel
+      run: |
+        # Upstream Next's drivers/kernelsu/Kbuild hard-errors at parse time
+        # when neither CONFIG_KPROBES nor CONFIG_KSU_SUSFS is set. During
+        # build.sh's mrproper phase no .config exists yet, so the clean step
+        # dies before defconfig ever sets CONFIG_KSU_SUSFS=y. Demote to a
+        # warning: the message stays visible, and the real build still gets
+        # CONFIG_KSU_SUSFS=y via defconfig. No-op if upstream drops the guard.
+        for d in common/drivers/kernelsu drivers/kernelsu; do
+          if [ -f "$d/Kbuild" ] && grep -q 'KernelSU requires either CONFIG_KPROBES' "$d/Kbuild"; then
+            sed -i 's/$(error "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")/$(warning "KernelSU requires either CONFIG_KPROBES=y or CONFIG_KSU_SUSFS=y")/' "$d/Kbuild"
+            echo "Softened KSU config guard in $d/Kbuild"
+          fi
+        done
+
+    - name: Disable multi-manager for BakaSU
+      if: inputs.flavor == 'bakasu'
       uses: ./.github/actions/set-kernel-config
       with:
         config_list: |
           CONFIG_KSU_MULTI_MANAGER_SUPPORT=n
           CONFIG_KSU_TOOLKIT_SUPPORT=y
+
+    - name: Soften BakaSU Kbuild submodule check for bazel builds
+      if: inputs.flavor == 'bakasu'
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel
+      run: |
+        # Fallback: demote the git submodule check from error to warning.
+        # Modify the Kbuild in the BakaSU checkout so the change propagates
+        # through the symlink into bazel sandbox.
+        for d in BakaSU/kernel; do
+          if [ -f "$d/Kbuild" ] && grep -q 'You should use \$(REPO_NAME) as a git submodule instead of copying code directly' "$d/Kbuild"; then
+            sed -i 's/\$(error You should use \$(REPO_NAME) as a git submodule instead of copying code directly)/\$(warning You should use \$(REPO_NAME) as a git submodule instead of copying code directly)/' "$d/Kbuild"
+            echo "Softened BakaSU submodule check in $d/Kbuild"
+          fi
+        done
+
+    - name: Soften BakaSU susfs_compat gate for susfs-inline builds
+      if: inputs.flavor == 'bakasu'
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel
+      run: |
+        # BakaSU's kernel/tools/susfs_compat.mk ends with an UNCONDITIONAL
+        # $(error "Please wait susfs update.") that fires on every
+        # CONFIG_KSU_SUSFS=y build (run 38221374132: the 6.1 BakaSU leg).
+        # The file's real work - the grep-based KSU_COMPAT_HAS_* defines
+        # above the gate - adapts the code to both old and new susfs
+        # layouts, so the hard stop is overcautious for our builds. Strip
+        # the tail (both $(info) lines and the $(error)), keep the shims.
+        F="BakaSU/kernel/tools/susfs_compat.mk"
+        if [ -f "$F" ] && grep -q 'Please wait susfs update' "$F"; then
+          sed -i '/susfs has NOT update with latest KernelSU source/,$d' "$F"
+          echo "Stripped susfs_compat hard stop from $F"
+        else
+          echo "No susfs_compat gate present; nothing to do"
+        fi

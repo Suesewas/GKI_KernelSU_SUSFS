@@ -49,13 +49,16 @@ runs:
         export CCACHE_COMPRESSION="true"
         echo CCACHE_COMPRESSION="true" >> $GITHUB_ENV
         export CCACHE_COMPRESSLEVEL="3"
-        echo CCACHE_COMPRESSION_LEVEL="3" >> $GITHUB_ENV
+        echo CCACHE_COMPRESSLEVEL="3" >> $GITHUB_ENV
         export CCACHE_DIRECT="true"
         echo CCACHE_DIRECT="true" >> "$GITHUB_ENV"
-        export CCACHE_FILE_CLONE="true"
-        echo CCACHE_FILE_CLONE="true" >> "$GITHUB_ENV"
-        export CCACHE_INODE_CACHE="true"
-        echo CCACHE_INODE_CACHE="true" >> "$GITHUB_ENV"
+        # No CCACHE_FILECLONE: ccache documents compression and file_clone as
+        # mutually exclusive ("Compression will be disabled if file cloning
+        # ... is enabled"), so the old misspelled pair set neither. Dropped
+        # rather than spelled correctly, since COMPRESSLEVEL is the one that
+        # does anything here.
+        export CCACHE_INODECACHE="true"
+        echo CCACHE_INODECACHE="true" >> "$GITHUB_ENV"
         export CCACHE_IS_KERNEL_COMPILING="true"
         echo CCACHE_IS_KERNEL_COMPILING="true" >> $GITHUB_ENV
         export CCACHE_UMASK="002"

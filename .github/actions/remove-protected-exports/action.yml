@@ -50,13 +50,19 @@ runs:
           fi
         fi
 
-        # Remove protected_module_names_list for 6.12+ kernels (Bazel build system)
+        # Remove protected_module_names_list for 6.12+ kernels (Bazel build system).
+        # The target prefix is not stable across releases - it was
+        # ":gki_aarch64_protected_module_names" and is now
+        # ":microdroid_aarch64_protected_module_names" - so match any label
+        # ending in _protected_module_names rather than pinning one name.
         if grep -q 'protected_module_names_list' common/BUILD.bazel; then
           BEFORE_BUILD_BAZEL_SHA="$(sha256sum common/BUILD.bazel | awk '{print $1}')"
-          perl -pi -e 's/^\s*protected_module_names_list\s*=\s*":gki_(?:aarch64|x86_64)_protected_module_names",\s*$//;' common/BUILD.bazel
+          perl -pi -e 's/^\s*protected_module_names_list\s*=\s*":[A-Za-z0-9_]*_protected_module_names",\s*$//;' common/BUILD.bazel
           AFTER_BUILD_BAZEL_SHA="$(sha256sum common/BUILD.bazel | awk '{print $1}')"
           if [ "$BEFORE_BUILD_BAZEL_SHA" = "$AFTER_BUILD_BAZEL_SHA" ]; then
-            echo "Warning: common/BUILD.bazel was not modified for protected_module_names_list (may not be present)"
+            echo "Error: common/BUILD.bazel was not modified for protected_module_names_list"
+            grep -n 'protected_module_names_list' common/BUILD.bazel || true
+            exit 1
           fi
           if grep -q 'protected_module_names_list' common/BUILD.bazel; then
             echo "Error: protected_module_names_list reference still present in common/BUILD.bazel"
