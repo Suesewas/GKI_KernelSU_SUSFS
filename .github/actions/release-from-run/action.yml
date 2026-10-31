@@ -184,6 +184,47 @@ runs:
         done
         rm -f /tmp/nm.zip
 
+    - name: Download boot images from source run
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SOURCE_RUN_ID: ${{ steps.src.outputs.run_id }}
+      run: |
+        set -euo pipefail
+        mkdir -p release-assets
+
+        names=$(mktemp)
+        for page in $(seq 1 20); do
+          batch=$(gh api "repos/${{ github.repository }}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100&page=${page}" \
+            --jq '.artifacts[].name' || true)
+          [ -z "$batch" ] && break
+          printf '%s\n' "$batch" >> "$names"
+          count=$(grep -c . <<<"$batch" || true)
+          [ "$count" -lt 100 ] && break
+        done
+        mapfile -t bi < <(grep -E -- '-boot\.img$' "$names" | sort -u || true)
+        rm -f "$names"
+
+        echo "Found ${#bi[@]} boot image artifacts"
+        for name in "${bi[@]}"; do
+          [ -f "release-assets/${name}" ] && continue
+          url=$(gh api "repos/${{ github.repository }}/actions/runs/${SOURCE_RUN_ID}/artifacts?name=${name}" \
+            --jq '.artifacts[0].archive_download_url // empty')
+          [[ -z "$url" ]] && { echo "  WARN: no url for ${name}"; continue; }
+          curl -fsSL --retry 3 --retry-delay 2 -H "Authorization: Bearer ${GH_TOKEN}" \
+            -o /tmp/bi.zip "$url" || { echo "  WARN: failed ${name}"; continue; }
+          rm -rf /tmp/bi && mkdir -p /tmp/bi
+          unzip -q -o /tmp/bi.zip -d /tmp/bi
+          if [ -f /tmp/bi/boot.img ]; then
+            cp /tmp/bi/boot.img "release-assets/${name}"
+            [ -f /tmp/bi/boot.img.sha256 ] && cp /tmp/bi/boot.img.sha256 "release-assets/${name}.sha256"
+            echo "  packed ${name} ($(stat -c %s "release-assets/${name}") bytes)"
+          else
+            echo "  WARN: ${name} has no boot.img inside"
+          fi
+        done
+        rm -rf /tmp/bi /tmp/bi.zip
+
     - name: Download release notes from source run
       shell: bash
       env:
