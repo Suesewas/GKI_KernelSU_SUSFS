@@ -505,16 +505,24 @@ static bool kg_prop_lookup(u32 uid, u32 appid, const char *path,
 	t = rcu_dereference(kg_prop_map);
 	if (t) {
 		for (i = 0; i < t->count; i++) {
+			const struct kg_prop_entry *e = &t->e[i];
 			bool is_exact, is_wild;
 
-			if (t->e[i].tlen != (u32)len)
-				continue;
-			is_exact = t->e[i].key == uid;
-			is_wild = t->e[i].key == appid;
+			is_exact = e->key == uid;
+			is_wild = e->key == appid;
 			if (!is_exact && !is_wild)
 				continue;
-			if (memcmp(t->e[i].target, path, len) != 0)
-				continue;
+			if (kg_prop_is_dir(e)) {
+				if (len <= e->tlen)
+					continue;
+				if (memcmp(e->target, path, e->tlen) != 0)
+					continue;
+			} else {
+				if (e->tlen != (u32)len)
+					continue;
+				if (memcmp(e->target, path, len) != 0)
+					continue;
+			}
 			if (is_exact) {
 				exact = i;
 				break;
@@ -524,8 +532,26 @@ static bool kg_prop_lookup(u32 uid, u32 appid, const char *path,
 		}
 		i = exact >= 0 ? exact : wild;
 		if (i >= 0) {
-			strscpy(out, t->e[i].redirect, outlen);
-			found = true;
+			const struct kg_prop_entry *e = &t->e[i];
+
+			if (kg_prop_is_dir(e)) {
+				size_t rlen = strnlen(e->redirect, KG_PROP_LEN);
+				size_t tail = len - e->tlen;
+
+				/* same shape as kg_prop_redirect: the rule
+				 * names a directory, so the tail of the path
+				 * is carried over to the replacement
+				 */
+				if (rlen > 0 && rlen + tail < outlen) {
+					memcpy(out, e->redirect, rlen);
+					memcpy(out + rlen, path + e->tlen, tail);
+					out[rlen + tail] = '\0';
+					found = true;
+				}
+			} else {
+				strscpy(out, e->redirect, outlen);
+				found = true;
+			}
 		}
 	}
 	rcu_read_unlock();

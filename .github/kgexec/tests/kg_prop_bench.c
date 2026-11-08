@@ -85,6 +85,48 @@ static void bench_remap(void)
         kg_remap_n > 1 && strcmp(kg_remaps[1].src,
             "/dev/envspoof/p10324/u:object_r:radio_prop:s0") == 0);
 
+    /* Одно правило на каталог закрывает всю область: иначе на приложение
+       уходит запись на каждый файл, и таблица кончается на восьмом.
+       Подмена уже унаследованного отображения обязана понимать такое
+       правило так же, как перенаправление открытия */
+    kg_prop_proc_write(NULL, "clear", 5, NULL);
+    add(10324, "/dev/__properties__/", "/dev/envspoof/p10324/");
+    remap_case(10324, 5);
+    /* правило на каталог закрывает всю область, включая файлы, которых в
+       пофайловом перечне не было: ими область и выдавала себя */
+    chk("по каталогу подменена вся область", kg_remap_n == 4);
+    chk("хвост пути перенесён в замену",
+        kg_remap_n > 0 && strcmp(kg_remaps[0].src,
+            "/dev/envspoof/p10324/property_info") == 0);
+    chk("файл вне пофайлового перечня тоже подменён",
+        kg_remap_n > 3 && strcmp(kg_remaps[3].src,
+            "/dev/envspoof/p10324/u:object_r:other_prop:s0") == 0);
+    chk("чужой каталог по правилу не трогается", kg_remap_n == 4);
+    chk("адрес и длина при каталоге сохранены",
+        kg_remap_n > 1 && kg_remaps[1].addr == 0x40000 && kg_remaps[1].len == L);
+
+    remap_case(10999, 5);
+    chk("по каталогу чужому uid не подменяется ничего", kg_remap_n == 0);
+
+    /* правило на приложение закрывает все профили, точное — сильнее */
+    kg_prop_proc_write(NULL, "clear", 5, NULL);
+    add(10324, "/dev/__properties__/", "/dev/envspoof/p10324/");
+    remap_case(1110324, 5);
+    chk("клон без своего правила идёт по правилу приложения",
+        kg_remap_n == 4 && strcmp(kg_remaps[0].src,
+            "/dev/envspoof/p10324/property_info") == 0);
+    add(1110324, "/dev/__properties__/", "/dev/envspoof/p1110324/");
+    remap_case(1110324, 5);
+    chk("своё правило клона сильнее правила приложения",
+        kg_remap_n == 4 && strcmp(kg_remaps[0].src,
+            "/dev/envspoof/p1110324/property_info") == 0);
+
+    kg_prop_proc_write(NULL, "clear", 5, NULL);
+    add(10324, "/dev/__properties__/u:object_r:build_prop:s0",
+        "/dev/envspoof/p10324/u:object_r:build_prop:s0");
+    add(10324, "/dev/__properties__/u:object_r:radio_prop:s0",
+        "/dev/envspoof/p10324/u:object_r:radio_prop:s0");
+
     remap_case(10999, 5);
     chk("чужому uid не подменяется ничего", kg_remap_n == 0);
 
