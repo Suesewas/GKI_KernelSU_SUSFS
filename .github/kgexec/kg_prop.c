@@ -29,7 +29,7 @@
 
 #include <linux/kg_prop.h>
 
-#define KG_PROP_ABI	2
+#define KG_PROP_ABI	3
 #define KG_PROP_MAX	192
 #define KG_PROP_LEN	128
 #define KG_PROP_W	127

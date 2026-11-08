@@ -151,8 +151,26 @@ static void bench_remap(void)
     kg_current.mm = &kg_mm;
 }
 
+/* Образ сворачивает правила в одно на каталог только там, где ядро умеет
+   разбирать его обеими сторонами. Узнать это оно может единственным
+   способом — по номеру abi, поэтому номер обязан вырасти вместе с
+   умением */
+static void bench_abi(void)
+{
+    char buf[4096];
+    loff_t off = 0;
+    long n = kg_prop_proc_read(NULL, buf, sizeof(buf) - 1, &off);
+
+    buf[n > 0 ? n : 0] = '\0';
+    chk("чтение отдаёт abi 3", n > 0 && strncmp(buf, "abi 3\n", 6) == 0);
+    chk("правило на каталог понимают обе стороны",
+        KG_PROP_ABI >= 3);
+}
+
 int main(void) {
     char cmd[64];
+
+    bench_abi();
 
     chk("add точного пути принят", add(10091, "/proc/version", "/dev/envspoof/10091/version") > 0);
     chk("точный путь перенаправлен",

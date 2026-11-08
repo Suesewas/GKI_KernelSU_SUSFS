@@ -58,7 +58,24 @@ extern struct task kg_current;
 #define capable(x) 1
 #define CAP_SYS_ADMIN 0
 #define copy_from_user(d, s, n) (memcpy((d), (s), (n)), 0)
-#define simple_read_from_buffer(ub, l, off, b, n) (0)
+static inline long kg_stub_read_buf(char *ub, unsigned long l, loff_t *off,
+				    const char *b, long n)
+{
+	long pos = off ? (long)*off : 0;
+	long take;
+
+	if (pos >= n)
+		return 0;
+	take = n - pos;
+	if ((unsigned long)take > l)
+		take = (long)l;
+	memcpy(ub, b + pos, (size_t)take);
+	if (off)
+		*off = pos + take;
+	return take;
+}
+#define simple_read_from_buffer(ub, l, off, b, n) \
+	kg_stub_read_buf((ub), (l), (off), (b), (n))
 #define proc_create(a, b, c, d) (void *)1
 #define default_llseek 0
 #define __init
