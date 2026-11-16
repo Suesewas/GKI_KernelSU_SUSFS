@@ -60,7 +60,7 @@ static inline void kg_art_set_arg(struct pt_regs *regs, int n, unsigned long v)
 }
 #endif
 
-#define KG_ABI		9
+#define KG_ABI		10
 #define KG_MAX_APPS	512
 #define KG_SEEN_MAX	256
 #define KG_APP_MIN	10000
@@ -79,8 +79,10 @@ static inline void kg_art_set_arg(struct pt_regs *regs, int n, unsigned long v)
 #define KG_FLAG_DEX	8
 #define KG_FLAG_DEXFILE	16
 #define KG_SEEN_MEM	32
+#define KG_FLAG_WEB	64
 #define KG_FLAG_ALL	(KG_FLAG_MEM | KG_FLAG_FILE | KG_FLAG_WATCH | KG_FLAG_DEX | \
-			 KG_FLAG_DEXFILE)
+			 KG_FLAG_DEXFILE | KG_FLAG_WEB)
+#define KG_WEB_MAX	4
 #define KG_DEX_PEEK	4096
 #define KG_CD_MAX	(64 * 1024)
 #define KG_CMD_MAX	256
@@ -145,6 +147,71 @@ static const char * const kg_allow[] = {
 	"/data/dalvik-cache/",
 	"/data/misc/apexdata/com.android.art/dalvik-cache/",
 };
+
+/* Движок веб-страниц грузится в процесс самого приложения: свой
+   загрузчик классов, своя нативная часть, свои ресурсы — и по объёму
+   кода он больше всего остального, что приложение тянет в себя. Пути
+   ставит пользовательская часть: ядру имена пакетов знать неоткуда. */
+static char kg_web_path[KG_WEB_MAX][KG_PATH_MAX];
+static int kg_web_n;
+static DEFINE_MUTEX(kg_web_lock);
+
+static bool kg_web_hit(const char *p)
+{
+	bool hit = false;
+	int i;
+
+	mutex_lock(&kg_web_lock);
+	for (i = 0; i < kg_web_n; i++) {
+		size_t n = strlen(kg_web_path[i]);
+
+		if (n && strncmp(p, kg_web_path[i], n) == 0) {
+			hit = true;
+			break;
+		}
+	}
+	mutex_unlock(&kg_web_lock);
+
+	return hit;
+}
+
+static int kg_web_cmd(const char *arg)
+{
+	int ret = 0;
+
+	mutex_lock(&kg_web_lock);
+	if (kg_sealed) {
+		mutex_unlock(&kg_web_lock);
+		return -EPERM;
+	}
+
+	if (strcmp(arg, "clear") == 0) {
+		kg_web_n = 0;
+	} else if (arg[0] != '/') {
+		ret = -EINVAL;
+	} else if (kg_web_n >= KG_WEB_MAX) {
+		ret = -ENOSPC;
+	} else {
+		strscpy(kg_web_path[kg_web_n], arg, KG_PATH_MAX);
+		kg_web_n++;
+	}
+	mutex_unlock(&kg_web_lock);
+
+	return ret;
+}
+
+static int kg_web_report(char *out, size_t max)
+{
+	int n, i;
+
+	mutex_lock(&kg_web_lock);
+	n = scnprintf(out, max, "web %d\n", kg_web_n);
+	for (i = 0; i < kg_web_n && (size_t)n < max - 32; i++)
+		n += scnprintf(out + n, max - n, "webpath %s\n", kg_web_path[i]);
+	mutex_unlock(&kg_web_lock);
+
+	return n;
+}
 
 static u8 kg_flags_now(u32 *out_appid, bool *soft)
 {
@@ -445,7 +512,7 @@ bool kg_dex_block_open(struct file *file)
 		return false;
 
 	flags = kg_flags_now(&appid, &soft);
-	if (!(flags & KG_FLAG_DEXFILE))
+	if (!(flags & (KG_FLAG_DEXFILE | KG_FLAG_WEB)))
 		return false;
 
 	if (!(file->f_mode & FMODE_READ))
@@ -458,7 +525,30 @@ bool kg_dex_block_open(struct file *file)
 		return false;
 
 	p = d_path(&file->f_path, buf, PAGE_SIZE);
-	if (IS_ERR(p) || kg_in_allow(p) || kg_own_oat(p)) {
+	if (IS_ERR(p)) {
+		free_page((unsigned long)buf);
+		return false;
+	}
+
+	/* Движок веб-страниц лежит в системном пути, то есть под общим
+	   разрешением: его закрывает отдельный признак и только тем
+	   приложениям, которым он поставлен. */
+	if ((flags & KG_FLAG_WEB) && kg_web_hit(p)) {
+		kg_mark_seen(appid, KG_FLAG_WEB);
+		if (soft) {
+			pr_info_ratelimited("uid %u comm %s web engine open observed: %s\n",
+					    from_kuid(&init_user_ns, current_uid()),
+					    current->comm, p);
+		} else {
+			pr_warn_ratelimited("uid %u comm %s web engine open denied: %s\n",
+					    from_kuid(&init_user_ns, current_uid()),
+					    current->comm, p);
+			free_page((unsigned long)buf);
+			return true;
+		}
+	}
+
+	if (!(flags & KG_FLAG_DEXFILE) || kg_in_allow(p) || kg_own_oat(p)) {
 		free_page((unsigned long)buf);
 		return false;
 	}
@@ -1244,6 +1334,7 @@ static ssize_t kg_proc_read(struct file *file, char __user *ubuf,
 		       READ_ONCE(kg_sys_flags));
 	n += scnprintf(out + n, KG_OUT_MAX - n, "count %d\n", t ? t->count : 0);
 	n += kg_art_report(out + n, KG_OUT_MAX - n);
+	n += kg_web_report(out + n, KG_OUT_MAX - n);
 	if (t) {
 		for (i = 0; i < t->count && n < KG_OUT_MAX - 32; i++)
 			n += scnprintf(out + n, KG_OUT_MAX - n, "%u %u\n",
@@ -1301,6 +1392,9 @@ static ssize_t kg_proc_write(struct file *file, const char __user *ubuf,
 	else if (strcmp(verb, "art") == 0 &&
 		 sscanf(cmd, "%15s %159s", verb, arg) == 2)
 		ret = kg_art_cmd(arg);
+	else if (strcmp(verb, "web") == 0 &&
+		 sscanf(cmd, "%15s %159s", verb, arg) == 2)
+		ret = kg_web_cmd(arg);
 	else if (strcmp(verb, "seen") == 0 &&
 		 sscanf(cmd, "%15s %159s %u", verb, arg, &appid) >= 2) {
 		if (strcmp(arg, "clear") == 0)

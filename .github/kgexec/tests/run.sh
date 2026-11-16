@@ -5,3 +5,5 @@ sed 's|^#include <linux/\(.*\)\.h>$|#include "linux/\1.h"|' ../kg_prop.c | grep 
 cc -I. -std=gnu11 -O1 -o kg_prop_bench kg_prop_bench.c
 ./kg_prop_bench
 rm -f kg_prop_body.c kg_prop_bench
+
+sh exec/run.sh
