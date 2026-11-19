@@ -1,0 +1,31 @@
+name: 'Build in the V4L2 loopback driver'
+description: 'Add the loopback video driver to the tree and build it in, not as a module'
+
+runs:
+  using: composite
+  steps:
+    - name: Put the driver into the tree
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: bash "${{ github.action_path }}/wire.sh" "${{ github.action_path }}"
+
+    - name: Require the driver options
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        set -euo pipefail
+        D=arch/arm64/configs/gki_defconfig
+        [ -f "$D" ] || { echo "gki_defconfig not found"; exit 1; }
+        want() {
+          sed -i "/^CONFIG_$1=/d; /^# CONFIG_$1 is not set\$/d" "$D"
+          echo "CONFIG_$1=y" >> "$D"
+          grep -q "^CONFIG_$1=y\$" "$D" \
+            || { echo "failed to set CONFIG_$1"; exit 1; }
+        }
+        # Загрузка модулей запрещена сторожем, поэтому драйвер идёт
+        # встроенным: узлы заводятся при загрузке, insmod не нужен.
+        want MEDIA_SUPPORT
+        want MEDIA_CAMERA_SUPPORT
+        want VIDEO_DEV
+        want VIDEOBUF2_VMALLOC
+        want VIDEO_V4L2LOOPBACK

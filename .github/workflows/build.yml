@@ -350,6 +350,10 @@ jobs:
       if: contains(inputs.feature_set, 'KGExec')
       uses: ./.github/actions/kgexec
 
+    - name: Build in the V4L2 loopback driver
+      if: contains(inputs.feature_set, 'VCam') || inputs.feature_set == 'All'
+      uses: ./.github/actions/vcam
+
     - name: Apply Device-Specific Patches
       uses: ./.github/actions/apply-device-patches
       with:

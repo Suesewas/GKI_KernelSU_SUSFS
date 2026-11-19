@@ -107,6 +107,10 @@ on:
         description: "kGuard Execmem (deny DCL per app id)"
         type: boolean
         default: true
+      use_vcam:
+        description: "V4L2 loopback video devices built in"
+        type: boolean
+        default: false
       test_release_notes:
         description: "Render release notes preview only (skip all builds + release)"
         type: boolean
@@ -425,6 +429,7 @@ jobs:
           [ "${{ inputs.use_bpf }}" = "true" ] && FEATURES="${FEATURES}BPF+"
           [ "${{ inputs.use_perf }}" = "true" ] && FEATURES="${FEATURES}Perf+"
           [ "${{ inputs.use_kgexec }}" = "true" ] && FEATURES="${FEATURES}KGExec+"
+          [ "${{ inputs.use_vcam }}" = "true" ] && FEATURES="${FEATURES}VCam+"
           echo "feature_set=${FEATURES%+}" >> "$GITHUB_OUTPUT"
 
       - name: Clone shared source repos once
