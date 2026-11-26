@@ -49,6 +49,19 @@ NOTE_HOOK = "\t\tksu_builtin_note(data->package, res);\n"
 COMMIT_ANCHOR = "\t// now update uid list\n"
 COMMIT_HOOK = "\tksu_builtin_commit();\n\n"
 
+# Менеджер ядро ищет только в /data/app. Встроенный в образ оно не видит,
+# а увидев — ведёт себя как с обычным: всегда пропускает его в root, и
+# менеджер сам раскладывает настоящий ksud, от которого зависят события
+# загрузки (монтирование модулей, подъём ksu_boot_completed). Условия к
+# раскладке ставит само ядро: файл называется base.apk, а имя пакета оно
+# берёт из имени каталога до первого дефиса (get_pkg_from_apk_dir_path),
+# то есть каталог должен быть <пакет>-<что угодно>.
+MGR_ANCHOR = '\t\tsearch_manager("/data/app", 2, &uid_list);\n'
+MGR_HOOK = ('\t\tif (!ksu_is_manager_appid_valid()) {\n'
+            '\t\t\tpr_info("Searching manager in /system/app...\\n");\n'
+            '\t\t\tsearch_manager("/system/app", 2, &uid_list);\n'
+            '\t\t}\n')
+
 BOOT_ANCHOR = "    ksu_observer_init();\n"
 BOOT_HOOK = ("    // Разбор packages.list: он заполняет appid пакетов,\n"
              "    // разрешённых сборкой. Чистка списка внутри требует\n"
@@ -219,6 +232,7 @@ def main():
         write(head, src)
 
     src = read(throne)
+    src = after(src, MGR_ANCHOR, MGR_HOOK, "поиск менеджера в образе")
     src = after(src, LIST_ANCHOR, LIST_HOOK, "начало разбора")
     src = after(src, NOTE_ANCHOR, NOTE_HOOK, "запись пакета")
     src = before(src, COMMIT_ANCHOR, COMMIT_HOOK, "публикация набора")
