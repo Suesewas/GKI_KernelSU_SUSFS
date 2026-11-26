@@ -24,10 +24,10 @@ runs:
         done
         grep -q 'ksu_builtin_allowed(uid)' "$A" ||
           { echo "ksugrant: gate not patched" >&2; exit 1; }
-        grep -q 'ksu_builtin_note(data->package, res)' "$T" ||
-          { echo "ksugrant: packages.list parse not patched" >&2; exit 1; }
-        grep -q 'ksu_builtin_commit()' "$T" ||
-          { echo "ksugrant: set is never published" >&2; exit 1; }
+        grep -q 'ksu_builtin_refresh()' "$T" ||
+          { echo "ksugrant: packages.list parse is not called" >&2; exit 1; }
+        grep -q 'void ksu_builtin_refresh(void)' "$A" ||
+          { echo "ksugrant: parse is missing" >&2; exit 1; }
         grep -q 'search_manager("/system/app", 2, &uid_list)' "$T" ||
           { echo "ksugrant: manager is not looked for in the image" >&2; exit 1; }
         # The parse has to run once without the real ksud: on_boot_completed

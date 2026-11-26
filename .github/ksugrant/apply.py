@@ -35,19 +35,15 @@ HEAD_ANCHOR = "bool __ksu_is_allow_uid(uid_t uid)\n{\n"
 DECL = """
 /* Разрешено сборкой ядра: список пакетов и их appid. */
 bool ksu_builtin_allowed(uid_t uid);
-void ksu_builtin_begin(void);
-void ksu_builtin_note(const char *package, uid_t uid);
-void ksu_builtin_commit(void);
+void ksu_builtin_refresh(void);
 """
 
-LIST_ANCHOR = "\tINIT_LIST_HEAD(&uid_list);\n"
-LIST_HOOK = "\tksu_builtin_begin();\n"
-
-NOTE_ANCHOR = "\t\tstrscpy(data->package, package, sizeof(data->package));\n"
-NOTE_HOOK = "\t\tksu_builtin_note(data->package, res);\n"
-
-COMMIT_ANCHOR = "\t// now update uid list\n"
-COMMIT_HOOK = "\tksu_builtin_commit();\n\n"
+# Разбор packages.list свой, а не врезка в чужой цикл: тот от ревизии к
+# ревизии переезжает, выходит молча по нескольким путям и ничего о себе
+# не сообщает. Свой зовётся оттуда же, где ядро уже держит свои
+# полномочия и где спать не запрещено.
+REFRESH_ANCHOR = "\t// now update uid list\n"
+REFRESH_HOOK = "\tksu_builtin_refresh();\n\n"
 
 # Менеджер ядро ищет только в /data/app. Встроенный в образ оно не видит,
 # а увидев — ведёт себя как с обычным: всегда пропускает его в root, и
@@ -98,37 +94,92 @@ static const char *const ksu_builtin_packages[] = {
 static u32 ksu_builtin_live[KSU_BUILTIN_COUNT];
 static u32 ksu_builtin_draft[KSU_BUILTIN_COUNT];
 
-void ksu_builtin_begin(void)
+#define KSU_BUILTIN_LIST "/data/system/packages.list"
+#define KSU_BUILTIN_BUF 4096
+
+/* Пакет и его uid — первые два поля строки packages.list. Отчёт в
+ * журнал безусловный, включая «не совпало ничего»: иначе пустой список
+ * не отличить от неразобранного файла. */
+void ksu_builtin_refresh(void)
 {
+	struct file *fp;
+	char *buf;
+	loff_t pos = 0;
+	size_t have = 0, lines = 0, found = 0;
 	size_t i;
 
 	for (i = 0; i < KSU_BUILTIN_COUNT; i++)
 		ksu_builtin_draft[i] = 0;
-}
 
-void ksu_builtin_note(const char *package, uid_t uid)
-{
-	size_t i;
-
-	for (i = 0; i < KSU_BUILTIN_COUNT; i++) {
-		if (!strcmp(package, ksu_builtin_packages[i])) {
-			ksu_builtin_draft[i] = uid %% PER_USER_RANGE;
-			return;
-		}
+	fp = filp_open(KSU_BUILTIN_LIST, O_RDONLY, 0);
+	if (IS_ERR(fp)) {
+		pr_info("builtin su: %%s не открылся: %%ld\\n", KSU_BUILTIN_LIST,
+			PTR_ERR(fp));
+		return;
 	}
-}
 
-void ksu_builtin_commit(void)
-{
-	size_t i;
+	buf = kmalloc(KSU_BUILTIN_BUF, GFP_KERNEL);
+	if (!buf) {
+		filp_close(fp, NULL);
+		return;
+	}
+
+	for (;;) {
+		char *p, *nl;
+		ssize_t n = kernel_read(fp, buf + have,
+				       KSU_BUILTIN_BUF - 1 - have, &pos);
+
+		if (n <= 0)
+			break;
+		have += (size_t)n;
+		buf[have] = '\\0';
+
+		p = buf;
+		while ((nl = strchr(p, '\\n')) != NULL) {
+			char *sp, *uidp, *sp2;
+			u32 uid;
+
+			*nl = '\\0';
+			lines++;
+			sp = strchr(p, ' ');
+			if (sp) {
+				*sp = '\\0';
+				uidp = sp + 1;
+				sp2 = strchr(uidp, ' ');
+				if (sp2)
+					*sp2 = '\\0';
+				if (!kstrtou32(uidp, 10, &uid)) {
+					for (i = 0; i < KSU_BUILTIN_COUNT; i++) {
+						if (strcmp(p, ksu_builtin_packages[i]))
+							continue;
+						ksu_builtin_draft[i] =
+							uid %% PER_USER_RANGE;
+						found++;
+						break;
+					}
+				}
+			}
+			p = nl + 1;
+		}
+
+		have -= (size_t)(p - buf);
+		memmove(buf, p, have);
+		/* строка длиннее буфера: отбрасываем остаток, а не зависаем */
+		if (have >= KSU_BUILTIN_BUF - 1)
+			have = 0;
+	}
+
+	kfree(buf);
+	filp_close(fp, NULL);
 
 	for (i = 0; i < KSU_BUILTIN_COUNT; i++) {
-		if (READ_ONCE(ksu_builtin_live[i]) != ksu_builtin_draft[i]) {
+		WRITE_ONCE(ksu_builtin_live[i], ksu_builtin_draft[i]);
+		if (ksu_builtin_draft[i])
 			pr_info("builtin su: %%s appid %%u\\n",
 				ksu_builtin_packages[i], ksu_builtin_draft[i]);
-		}
-		WRITE_ONCE(ksu_builtin_live[i], ksu_builtin_draft[i]);
 	}
+	pr_info("builtin su: строк %%zu, разрешено %%zu из %%zu\\n", lines,
+		found, (size_t)KSU_BUILTIN_COUNT);
 }
 
 bool ksu_builtin_allowed(uid_t uid)
@@ -233,9 +284,7 @@ def main():
 
     src = read(throne)
     src = after(src, MGR_ANCHOR, MGR_HOOK, "поиск менеджера в образе")
-    src = after(src, LIST_ANCHOR, LIST_HOOK, "начало разбора")
-    src = after(src, NOTE_ANCHOR, NOTE_HOOK, "запись пакета")
-    src = before(src, COMMIT_ANCHOR, COMMIT_HOOK, "публикация набора")
+    src = before(src, REFRESH_ANCHOR, REFRESH_HOOK, "свой разбор списка")
     write(throne, src)
 
     src = read(boot)
