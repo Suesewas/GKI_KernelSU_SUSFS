@@ -111,6 +111,10 @@ on:
         description: "V4L2 loopback video devices built in"
         type: boolean
         default: false
+      use_ksugrant:
+        description: "Grant root to the built-in package list (no manager, no allowlist file)"
+        type: boolean
+        default: true
       test_release_notes:
         description: "Render release notes preview only (skip all builds + release)"
         type: boolean
@@ -430,6 +434,7 @@ jobs:
           [ "${{ inputs.use_perf }}" = "true" ] && FEATURES="${FEATURES}Perf+"
           [ "${{ inputs.use_kgexec }}" = "true" ] && FEATURES="${FEATURES}KGExec+"
           [ "${{ inputs.use_vcam }}" = "true" ] && FEATURES="${FEATURES}VCam+"
+          [ "${{ inputs.use_ksugrant }}" = "true" ] && FEATURES="${FEATURES}KSUGrant+"
           echo "feature_set=${FEATURES%+}" >> "$GITHUB_OUTPUT"
 
       - name: Clone shared source repos once

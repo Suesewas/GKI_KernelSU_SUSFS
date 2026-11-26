@@ -1,0 +1,36 @@
+name: 'Grant root to built-in packages'
+description: 'Allow a compiled-in package list through the KernelSU gate, without the allowlist file'
+
+runs:
+  using: composite
+  steps:
+    - name: Apply ksugrant patch
+      shell: bash
+      run: |
+        set -euo pipefail
+        python3 "${{ github.workspace }}/.github/ksugrant/apply.py" \
+          "${{ github.workspace }}/kernel"
+
+    - name: Verify the gate carries the built-in check
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel
+      run: |
+        set -euo pipefail
+        A=KernelSU-Next/kernel/policy/allowlist.c
+        T=KernelSU-Next/kernel/manager/throne_tracker.c
+        B=KernelSU-Next/kernel/runtime/boot_event.c
+        for f in "$A" "$T" "$B"; do
+          test -f "$f" || { echo "ksugrant: missing $f" >&2; exit 1; }
+        done
+        grep -q 'ksu_builtin_allowed(uid)' "$A" ||
+          { echo "ksugrant: gate not patched" >&2; exit 1; }
+        grep -q 'ksu_builtin_note(data->package, res)' "$T" ||
+          { echo "ksugrant: packages.list parse not patched" >&2; exit 1; }
+        grep -q 'ksu_builtin_commit()' "$T" ||
+          { echo "ksugrant: set is never published" >&2; exit 1; }
+        # The parse has to run once without the real ksud: on_boot_completed
+        # is only reached through a ksud supercall, and post-fs-data is
+        # triggered by the kernel itself when zygote execs.
+        awk '/void on_post_fs_data\(void\)/,/^}/' "$B" | grep -q 'track_throne' ||
+          { echo "ksugrant: post-fs-data does not parse packages.list" >&2; exit 1; }
+        echo "ksugrant: gate, parse and publication in place"

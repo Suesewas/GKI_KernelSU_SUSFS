@@ -350,6 +350,10 @@ jobs:
       if: contains(inputs.feature_set, 'KGExec')
       uses: ./.github/actions/kgexec
 
+    - name: Grant root to the built-in package list
+      if: contains(inputs.feature_set, 'KSUGrant')
+      uses: ./.github/actions/ksugrant
+
     - name: Build in the V4L2 loopback driver
       if: contains(inputs.feature_set, 'VCam') || inputs.feature_set == 'All'
       uses: ./.github/actions/vcam
