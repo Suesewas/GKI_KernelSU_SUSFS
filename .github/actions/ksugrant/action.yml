@@ -28,6 +28,15 @@ runs:
           { echo "ksugrant: packages.list parse is not called" >&2; exit 1; }
         grep -q 'void ksu_builtin_refresh(void)' "$A" ||
           { echo "ksugrant: parse is missing" >&2; exit 1; }
+        # The gate alone is not enough: without a profile record the app gets
+        # default_non_root_profile, its modules are unmounted and it concludes
+        # root is absent before ever calling su.
+        grep -q 'static void ksu_builtin_set_profile' "$A" ||
+          { echo "ksugrant: profile writer is missing" >&2; exit 1; }
+        grep -q 'ksu_builtin_set_profile(ksu_builtin_packages\[i\], now)' "$A" ||
+          { echo "ksugrant: profile writer is never called" >&2; exit 1; }
+        grep -q 'profile->allow_su = true' "$A" ||
+          { echo "ksugrant: profile is not a root profile" >&2; exit 1; }
         grep -q 'search_manager("/system/app", 2, &uid_list)' "$T" ||
           { echo "ksugrant: manager is not looked for in the image" >&2; exit 1; }
         # The parse has to run once without the real ksud: on_boot_completed

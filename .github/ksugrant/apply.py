@@ -97,6 +97,43 @@ static u32 ksu_builtin_draft[KSU_BUILTIN_COUNT];
 #define KSU_BUILTIN_LIST "/data/system/packages.list"
 #define KSU_BUILTIN_BUF 4096
 
+/* Запись профиля — то же, что делает менеджер нажатием переключателя.
+ *
+ * Одного «да» в калитке мало: профиль ищут и те места, которые решают,
+ * что приложение увидит. ksu_uid_should_umount() без записи берёт
+ * default_non_root_profile и отмонтирует приложению модули, то есть оно
+ * не найдёт ни /data/adb/modules, ни своего модуля, и решит, что root
+ * нет, не дойдя до вызова su. Поэтому разрешённым пакетам ставится
+ * настоящая запись: allow_su, профиль по умолчанию (uid 0, полные
+ * capabilities, домен u:r:su:s0).
+ *
+ * profile_valid() сверяет selinux_domain даже при use_default, поэтому
+ * тело заполняется копией default_root_profile, а не нулями.
+ */
+static void ksu_builtin_set_profile(const char *pkg, uid_t uid)
+{
+	struct app_profile *profile;
+
+	profile = kzalloc(sizeof(*profile), GFP_KERNEL);
+	if (!profile)
+		return;
+
+	profile->version = KSU_APP_PROFILE_VER;
+	strscpy(profile->key, pkg, sizeof(profile->key));
+	profile->curr_uid = uid;
+	profile->allow_su = true;
+	profile->rp_config.use_default = true;
+	memcpy(&profile->rp_config.profile, &default_root_profile,
+	       sizeof(profile->rp_config.profile));
+
+	if (ksu_set_app_profile(profile))
+		pr_err("builtin su: профиль не лёг: %%s uid %%u\\n", pkg, uid);
+	else
+		pr_info("builtin su: профиль записан: %%s uid %%u\\n", pkg, uid);
+
+	kfree(profile);
+}
+
 /* Пакет и его uid — первые два поля строки packages.list. Отчёт в
  * журнал безусловный, включая «не совпало ничего»: иначе пустой список
  * не отличить от неразобранного файла. */
@@ -105,7 +142,7 @@ void ksu_builtin_refresh(void)
 	struct file *fp;
 	char *buf;
 	loff_t pos = 0;
-	size_t have = 0, lines = 0, found = 0;
+	size_t have = 0, lines = 0, found = 0, wrote = 0;
 	size_t i;
 
 	for (i = 0; i < KSU_BUILTIN_COUNT; i++)
@@ -173,13 +210,26 @@ void ksu_builtin_refresh(void)
 	filp_close(fp, NULL);
 
 	for (i = 0; i < KSU_BUILTIN_COUNT; i++) {
-		WRITE_ONCE(ksu_builtin_live[i], ksu_builtin_draft[i]);
-		if (ksu_builtin_draft[i])
-			pr_info("builtin su: %%s appid %%u\\n",
-				ksu_builtin_packages[i], ksu_builtin_draft[i]);
+		u32 was = READ_ONCE(ksu_builtin_live[i]);
+		u32 now = ksu_builtin_draft[i];
+
+		WRITE_ONCE(ksu_builtin_live[i], now);
+		if (!now)
+			continue;
+		pr_info("builtin su: %%s appid %%u\\n",
+			ksu_builtin_packages[i], now);
+		/* профиль ставится при первом появлении пакета и при смене
+		 * uid: разбор повторяется на каждое изменение packages.list,
+		 * а переписывать запись на каждый разбор незачем. */
+		if (now != was) {
+			ksu_builtin_set_profile(ksu_builtin_packages[i], now);
+			wrote++;
+		}
 	}
-	pr_info("builtin su: строк %%zu, разрешено %%zu из %%zu\\n", lines,
-		found, (size_t)KSU_BUILTIN_COUNT);
+	if (wrote)
+		ksu_persistent_allow_list();
+	pr_info("builtin su: строк %%zu, разрешено %%zu из %%zu, профилей %%zu\\n",
+		lines, found, (size_t)KSU_BUILTIN_COUNT, wrote);
 }
 
 bool ksu_builtin_allowed(uid_t uid)
