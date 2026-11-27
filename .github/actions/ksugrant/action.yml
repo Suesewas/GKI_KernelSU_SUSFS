@@ -1,47 +1,31 @@
-name: 'Grant root to built-in packages'
-description: 'Allow a compiled-in package list through the KernelSU gate, without the allowlist file'
+name: 'Find the manager in the system image too'
+description: 'Let the kernel crown a KernelSU manager that lives in /system/app, not only /data/app'
 
 runs:
   using: composite
   steps:
-    - name: Apply ksugrant patch
+    - name: Apply the manager-search patch
       shell: bash
       run: |
         set -euo pipefail
         python3 "${{ github.workspace }}/.github/ksugrant/apply.py" \
           "${{ github.workspace }}/kernel"
 
-    - name: Verify the gate carries the built-in check
+    - name: Verify the search covers the system image
       shell: bash
       working-directory: ${{ github.workspace }}/kernel
       run: |
         set -euo pipefail
-        A=KernelSU-Next/kernel/policy/allowlist.c
         T=KernelSU-Next/kernel/manager/throne_tracker.c
-        B=KernelSU-Next/kernel/runtime/boot_event.c
-        for f in "$A" "$T" "$B"; do
-          test -f "$f" || { echo "ksugrant: missing $f" >&2; exit 1; }
-        done
-        grep -q 'ksu_builtin_allowed(uid)' "$A" ||
-          { echo "ksugrant: gate not patched" >&2; exit 1; }
-        grep -q 'ksu_builtin_refresh()' "$T" ||
-          { echo "ksugrant: packages.list parse is not called" >&2; exit 1; }
-        grep -q 'void ksu_builtin_refresh(void)' "$A" ||
-          { echo "ksugrant: parse is missing" >&2; exit 1; }
-        # The gate alone is not enough: without a profile record the app gets
-        # default_non_root_profile, its modules are unmounted and it concludes
-        # root is absent before ever calling su.
-        grep -q 'static void ksu_builtin_set_profile' "$A" ||
-          { echo "ksugrant: profile writer is missing" >&2; exit 1; }
-        grep -q 'ksu_builtin_set_profile(ksu_builtin_packages\[i\], now)' "$A" ||
-          { echo "ksugrant: profile writer is never called" >&2; exit 1; }
-        grep -q 'profile->allow_su = true' "$A" ||
-          { echo "ksugrant: profile is not a root profile" >&2; exit 1; }
+        test -f "$T" || { echo "ksugrant: missing $T" >&2; exit 1; }
         grep -q 'search_manager("/system/app", 2, &uid_list)' "$T" ||
           { echo "ksugrant: manager is not looked for in the image" >&2; exit 1; }
-        # The parse has to run once without the real ksud: on_boot_completed
-        # is only reached through a ksud supercall, and post-fs-data is
-        # triggered by the kernel itself when zygote execs.
-        awk '/void on_post_fs_data\(void\)/,/^}/' "$B" | grep -q 'track_throne' ||
-          { echo "ksugrant: post-fs-data does not parse packages.list" >&2; exit 1; }
-        echo "ksugrant: gate, parse and publication in place"
+        # Only as a fallback: a manager installed in /data/app still wins.
+        grep -q 'if (!ksu_is_manager_appid_valid())' "$T" ||
+          { echo "ksugrant: the image search is not a fallback" >&2; exit 1; }
+        # Nothing else of the old patch may survive: root for the built-in
+        # list is handed out from userspace by `ksud profile set`.
+        A=KernelSU-Next/kernel/policy/allowlist.c
+        grep -q 'ksu_builtin' "$A" &&
+          { echo "ksugrant: the old built-in list is still patched in" >&2; exit 1; }
+        echo "ksugrant: manager search in the image is in place, nothing else touched"
